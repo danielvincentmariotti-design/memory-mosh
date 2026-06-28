@@ -1,0 +1,25 @@
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Large local media and output assets
+*.mp4
+*.mov
+*.avi
+*.webm
+*.mkv
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+
+output/
+outputs/
+raw/
+
+# Local env / editor files
+.vscode/
+.DS_Store
