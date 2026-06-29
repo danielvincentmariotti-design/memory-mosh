@@ -24,6 +24,12 @@ import random
 AVIIF_KEYFRAME = 0x10
 
 
+def rate_from_curve(base_rate, vividness, floor=0.02, strength=0.6):
+    """Scale a base rate down as vividness rises, keeping a minimum floor."""
+    vibe = max(0.0, min(1.0, vividness))
+    return max(floor, base_rate * (1.0 - vibe * strength))
+
+
 def read_chunks(data, start, end):
     """Yield (tag, data_offset, size) for RIFF chunks in data[start:end]."""
     pos = start
@@ -100,7 +106,7 @@ def annotate_frames(frames, keyframe_flags):
 
 def mosh(frames, keyframe_removal_rate=0.9, duplicate_rate=0.15,
          duplicate_range=(2, 4), freeze_chance=0.02, freeze_range=(6, 18),
-         seed=None):
+         seed=None, vividness_curve=None):
     """
     Build the moshed frame sequence.
 
@@ -130,11 +136,20 @@ def mosh(frames, keyframe_removal_rate=0.9, duplicate_rate=0.15,
             continue
 
         # delta frame
-        if rng.random() < freeze_chance:
+        frame_vividness = 0.5
+        if vividness_curve:
+            curve_idx = min(i - 1, len(vividness_curve) - 1)
+            frame_vividness = vividness_curve[curve_idx]
+
+        keyframe_rate = rate_from_curve(keyframe_removal_rate, frame_vividness)
+        duplicate_rate_eff = rate_from_curve(duplicate_rate, frame_vividness)
+        freeze_rate_eff = rate_from_curve(freeze_chance, frame_vividness)
+
+        if rng.random() < freeze_rate_eff:
             n = rng.randint(*freeze_range)
             out.extend([f] * n)
             duplicated += n - 1
-        elif rng.random() < duplicate_rate:
+        elif rng.random() < duplicate_rate_eff:
             n = rng.randint(*duplicate_range)
             out.extend([f] * n)
             duplicated += n - 1
