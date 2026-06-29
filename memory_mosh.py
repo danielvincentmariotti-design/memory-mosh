@@ -30,6 +30,8 @@ from tkinter import filedialog, messagebox, ttk
 import tkinter as tk
 from tkinter import Scrollbar
 
+STYLE_PATH = Path(__file__).with_name('styles.css')
+
 try:
     import PIL.Image
     import PIL.ImageTk
@@ -38,6 +40,81 @@ except ImportError:
 
 import avimosh
 from avimosh import rate_from_curve
+
+THEMES = {
+    'dark': {
+        'root_bg': '#121721',
+        'panel_bg': '#161c28',
+        'section_bg': '#1a2130',
+        'text_fg': '#f2ecdf',
+        'muted_fg': '#8e99aa',
+        'entry_bg': '#1a2232',
+        'entry_fg': '#f7f2e8',
+        'entry_active_bg': '#1f2940',
+        'button_bg': '#354152',
+        'button_fg': '#f7ebd2',
+        'button_active_bg': '#4b5568',
+        'button_active_fg': '#ffffff',
+        'check_hover_bg': '#2e3e54',
+        'check_hover_fg': '#ffffff',
+        'progress_bg': '#202838',
+        'progress_fg': '#8cbf8d',
+        'log_bg': '#0f141d',
+        'log_fg': '#f2ecdf',
+        'canvas_bg': '#1b1a18',
+        'curve_line': '#4f4b42',
+        'curve_peak': '#f0c36d',
+        'curve_low': '#8b6f47',
+    },
+    'light': {
+        'root_bg': '#f3f5f9',
+        'panel_bg': '#ffffff',
+        'section_bg': '#f8f9fc',
+        'text_fg': '#1f2937',
+        'muted_fg': '#667085',
+        'entry_bg': '#ffffff',
+        'entry_fg': '#111827',
+        'entry_active_bg': '#f2f5ff',
+        'button_bg': '#4b6cb7',
+        'button_fg': '#ffffff',
+        'button_active_bg': '#3f5f9d',
+        'button_active_fg': '#ffffff',
+        'check_hover_bg': '#dce7ff',
+        'check_hover_fg': '#1f2937',
+        'progress_bg': '#e5eaf2',
+        'progress_fg': '#2f8f45',
+        'log_bg': '#f8fafc',
+        'log_fg': '#0f172a',
+        'canvas_bg': '#f4f1ea',
+        'curve_line': '#c2b8a3',
+        'curve_peak': '#d08c2f',
+        'curve_low': '#9b7b4c',
+    },
+    'ember': {
+        'root_bg': '#19131a',
+        'panel_bg': '#241d24',
+        'section_bg': '#2b232c',
+        'text_fg': '#f7eae0',
+        'muted_fg': '#a48f87',
+        'entry_bg': '#2f252d',
+        'entry_fg': '#fff3eb',
+        'entry_active_bg': '#372c37',
+        'button_bg': '#7a3f3f',
+        'button_fg': '#fff6f1',
+        'button_active_bg': '#944b4b',
+        'button_active_fg': '#ffffff',
+        'check_hover_bg': '#55343e',
+        'check_hover_fg': '#fff3eb',
+        'progress_bg': '#3b2c2f',
+        'progress_fg': '#f28f4b',
+        'log_bg': '#140f13',
+        'log_fg': '#f7eae0',
+        'canvas_bg': '#221a1f',
+        'curve_line': '#705650',
+        'curve_peak': '#f0b25d',
+        'curve_low': '#8c5a3d',
+    },
+}
 
 
 def run_ffmpeg(args, label):
@@ -296,12 +373,14 @@ class MemoryMoshApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title('Memory Mosh')
-        self.geometry('1120x820')
-        self.minsize(980, 760)
+        self.geometry('1080x860')
+        self.minsize(820, 760)
         self.resizable(True, True)
+        self._apply_styles()
 
         self.input_var = tk.StringVar()
         self.output_var = tk.StringVar()
+        self.input_duration_var = tk.StringVar(value='')
         self.use_curve_var = tk.BooleanVar(value=True)
         self.audio_var = tk.BooleanVar(value=False)
         self.analysis_fps_var = tk.StringVar(value='4.0')
@@ -317,6 +396,8 @@ class MemoryMoshApp(tk.Tk):
         self.quality_var = tk.StringVar(value='3')
         self.seed_var = tk.StringVar(value='')
         self.preview_var = tk.StringVar(value='15')
+        self.theme_var = tk.StringVar(value='dark')
+        self._description_labels = []
 
         self._build_ui()
 
@@ -341,19 +422,36 @@ class MemoryMoshApp(tk.Tk):
         canvas.bind_all('<Button-4>', _on_touchpad)
         canvas.bind_all('<Button-5>', _on_touchpad)
 
-        frame = ttk.Frame(scroll_frame, padding=12)
+        frame = ttk.Frame(scroll_frame, padding=16)
         frame.pack(fill='both', expand=True)
+        frame.configure(style='TFrame')
 
-        ttk.Label(frame, text='Input video').grid(row=0, column=0, sticky='w')
-        ttk.Entry(frame, textvariable=self.input_var, width=60).grid(row=0, column=1, padx=6, pady=4)
-        ttk.Button(frame, text='Browse', command=self._pick_input).grid(row=0, column=2, padx=4)
+        frame.columnconfigure(0, minsize=120)
+        frame.columnconfigure(1, weight=1)
+        frame.columnconfigure(2, minsize=92)
 
-        ttk.Label(frame, text='Output video').grid(row=1, column=0, sticky='w')
-        ttk.Entry(frame, textvariable=self.output_var, width=60).grid(row=1, column=1, padx=6, pady=4)
-        ttk.Button(frame, text='Browse', command=self._pick_output).grid(row=1, column=2, padx=4)
+        ttk.Label(frame, text='Memory Mosh', style='Title.TLabel').grid(row=0, column=0, columnspan=3, sticky='w', pady=(0, 10))
 
-        ttk.Checkbutton(frame, text='Use vividness curve', variable=self.use_curve_var).grid(row=2, column=1, sticky='w', pady=4)
-        ttk.Checkbutton(frame, text='Analyze audio energy', variable=self.audio_var).grid(row=3, column=1, sticky='w', pady=4)
+        ttk.Label(frame, text='Theme', style='Control.TLabel').grid(row=1, column=0, sticky='w', pady=(0, 6))
+        theme_combo = ttk.Combobox(frame, textvariable=self.theme_var, values=list(THEMES.keys()), state='readonly', width=14)
+        theme_combo.grid(row=1, column=1, sticky='w', padx=6, pady=(0, 6))
+        theme_combo.bind('<<ComboboxSelected>>', lambda _event: self._apply_styles())
+
+        ttk.Label(frame, text='Input video', style='Control.TLabel').grid(row=2, column=0, sticky='w', pady=(0, 4))
+        ttk.Entry(frame, textvariable=self.input_var, width=44, style='Entry.TEntry').grid(row=2, column=1, sticky='ew', padx=6, pady=(0, 4))
+        ttk.Button(frame, text='Browse', command=self._pick_input, style='Secondary.TButton').grid(row=2, column=2, padx=4, pady=(0, 4), sticky='ew')
+        ttk.Label(frame, textvariable=self.input_duration_var, style='Description.TLabel').grid(row=3, column=1, sticky='w', padx=6, pady=(0, 4))
+
+        ttk.Label(frame, text='Output video', style='Control.TLabel').grid(row=4, column=0, sticky='w', pady=(0, 4))
+        ttk.Entry(frame, textvariable=self.output_var, width=44, style='Entry.TEntry').grid(row=4, column=1, sticky='ew', padx=6, pady=(0, 4))
+        ttk.Button(frame, text='Browse', command=self._pick_output, style='Secondary.TButton').grid(row=4, column=2, padx=4, pady=(0, 4), sticky='ew')
+
+        checkbox_row = ttk.Frame(frame)
+        checkbox_row.grid(row=5, column=1, sticky='w', pady=(6, 2))
+        checkbox_row.columnconfigure(0, weight=1)
+        checkbox_row.columnconfigure(1, weight=1)
+        ttk.Checkbutton(checkbox_row, text='Use vividness curve', variable=self.use_curve_var).grid(row=0, column=0, sticky='w', padx=(0, 16))
+        ttk.Checkbutton(checkbox_row, text='Analyze audio energy', variable=self.audio_var).grid(row=0, column=1, sticky='w')
 
         effect_groups = [
             ('Curve', [
@@ -361,7 +459,7 @@ class MemoryMoshApp(tk.Tk):
                 {'label': 'Curve cycles', 'variable': self.cycles_var, 'from_': 0.5, 'to': 6.0, 'step': 0.1, 'description': 'How many wave cycles sweep across the clip.'},
                 {'label': 'Motion weight', 'variable': self.motion_weight_var, 'from_': 0.0, 'to': 1.0, 'step': 0.05, 'description': 'How strongly motion influences the intensity curve.'},
                 {'label': 'Audio weight', 'variable': self.audio_weight_var, 'from_': 0.0, 'to': 1.0, 'step': 0.05, 'description': 'How strongly audio energy nudges the curve.'},
-            ], 4),
+            ], 7),
             ('Mosh', [
                 {'label': 'Keyframe removal rate', 'variable': self.keyframe_rate_var, 'from_': 0.0, 'to': 1.0, 'step': 0.05, 'description': 'How often real keyframes are dropped.'},
                 {'label': 'Duplicate rate', 'variable': self.duplicate_rate_var, 'from_': 0.0, 'to': 1.0, 'step': 0.05, 'description': 'How often delta frames are repeated for glitch streaks.'},
@@ -369,18 +467,20 @@ class MemoryMoshApp(tk.Tk):
                 {'label': 'Freeze chance', 'variable': self.freeze_chance_var, 'from_': 0.0, 'to': 0.25, 'step': 0.01, 'description': 'How often the corruption holds longer as a freeze.'},
                 {'label': 'Freeze min', 'variable': self.freeze_min_var, 'from_': 1, 'to': 24, 'step': 1, 'description': 'Shortest freeze length in frames.'},
                 {'label': 'Freeze max', 'variable': self.freeze_max_var, 'from_': 2, 'to': 48, 'step': 1, 'description': 'Longest freeze length in frames.'},
-            ], 8),
+            ], 11),
             ('Output', [
                 {'label': 'Quality', 'variable': self.quality_var, 'from_': 1, 'to': 31, 'step': 1, 'description': 'The intermediate AVI quality. Lower is cleaner.'},
                 {'label': 'Preview duration (s)', 'variable': self.preview_var, 'from_': 5, 'to': 30, 'step': 1, 'description': 'How long the preview export should be.'},
                 {'label': 'Seed', 'variable': self.seed_var, 'kind': 'entry', 'description': 'Optional random seed for repeatable glitches.'},
-            ], 12),
+            ], 15),
         ]
 
         self.group_frames = {}
         for group_name, items, start_row in effect_groups:
             group = ttk.LabelFrame(frame, text=group_name, padding=8)
             group.grid(row=start_row, column=0, columnspan=3, sticky='nsew', pady=6)
+            group.configure(style='Section.TLabelframe')
+            group.configure(padding=10)
             self.group_frames[group_name] = group
             self._build_group_controls(group, items)
 
@@ -389,76 +489,207 @@ class MemoryMoshApp(tk.Tk):
         self._toggle_group('Output', True)
 
         self.controls_content = ttk.Frame(frame)
-        self.controls_content.grid(row=20, column=0, columnspan=3, sticky='nsew', pady=(8, 0))
+        self.controls_content.grid(row=23, column=0, columnspan=3, sticky='nsew', pady=(8, 0))
+        self.controls_content.configure(style='Panel.TFrame')
 
         self.status_var = tk.StringVar(value='Ready')
         ttk.Label(self.controls_content, textvariable=self.status_var).pack(anchor='w', pady=(0, 6))
         self.progress_var = tk.DoubleVar(value=0.0)
-        self.progress = ttk.Progressbar(self.controls_content, orient='horizontal', mode='determinate', variable=self.progress_var, maximum=100)
+        self.progress = ttk.Progressbar(self.controls_content, orient='horizontal', mode='determinate', variable=self.progress_var, maximum=100, style='TProgressbar')
         self.progress.pack(fill='x', pady=(0, 8))
 
         self.vividness_frame = ttk.LabelFrame(self.controls_content, text='Vividness', padding=8)
         self.vividness_frame.pack(fill='x', pady=(0, 8))
-        self.vividness_canvas = tk.Canvas(self.vividness_frame, width=320, height=90, bg='#1b1a18', highlightthickness=0)
-        self.vividness_canvas.pack(fill='x')
+        self.vividness_frame.configure(style='Section.TLabelframe')
+        self.vividness_canvas = tk.Canvas(self.vividness_frame, width=1, height=90, bg='#1b1a18', highlightthickness=0)
+        self.vividness_canvas.pack(fill='both', expand=True)
+        self.vividness_canvas.bind('<Configure>', self._draw_vividness_preview)
         self._draw_vividness_preview()
         self.after(100, self._animate_vividness_preview)
 
         self.log = tk.Text(self.controls_content, height=6, width=90)
         self.log.pack(fill='both', expand=True, pady=(0, 8))
+        self.log.configure(state='normal')
         self.log.insert('1.0', 'Run status will appear here.\n')
         self.log.configure(state='disabled')
+        self._apply_styles()
 
         self.preview_panel = ttk.LabelFrame(self.controls_content, text='Preview export', padding=8)
         self.preview_panel.pack(fill='x', pady=(0, 8))
+        self.preview_panel.configure(style='Section.TLabelframe')
         ttk.Label(self.preview_panel, text='Render a short preview file instead of an in-app player.', foreground='#555').pack(anchor='w')
         ttk.Label(self.preview_panel, text='The preview is written as a .preview.mp4 next to your input video.', foreground='#777').pack(anchor='w', pady=(4, 0))
 
         self.action_frame = ttk.Frame(self.controls_content)
         self.action_frame.pack(fill='x')
-        self.preview_button = ttk.Button(self.action_frame, text='Render 15s Preview', command=self._run_preview, width=20)
+        self.preview_button = ttk.Button(self.action_frame, text='Render 15s Preview', command=self._run_preview, width=20, style='Primary.TButton')
         self.preview_button.pack(side='left', padx=(0, 8))
-        self.preview_button.configure(style='Accent.TButton')
-        self.run_button = ttk.Button(self.action_frame, text='Run', command=self._run_pipeline, width=14)
+        self.run_button = ttk.Button(self.action_frame, text='Run', command=self._run_pipeline, width=14, style='Run.TButton')
         self.run_button.pack(side='left')
-        self.run_button.configure(style='Success.TButton')
 
         self.controls_content.columnconfigure(0, weight=1)
+        self.bind('<Configure>', self._handle_window_resize)
+        self.after(50, self._handle_window_resize)
+
+    def _apply_styles(self):
+        theme_name = self.theme_var.get() if hasattr(self, 'theme_var') and self.theme_var.get() else 'dark'
+        palette = THEMES.get(theme_name, THEMES['dark'])
+        style = ttk.Style(self)
+        style.theme_use('clam')
+        css_rules = self._load_css_rules()
+
+        def _get_props(selector):
+            return css_rules.get(selector, {})
+
+        self.configure(bg=palette['root_bg'])
+
+        style.configure('Panel.TFrame', background=palette['panel_bg'])
+        style.configure('Section.TLabelframe', background=palette['section_bg'], foreground=palette['text_fg'])
+        style.configure('Section.TLabelframe.Label', background=palette['section_bg'], foreground=palette['text_fg'], font=('Segoe UI', 11, 'bold'))
+
+        title_props = _get_props('.title')
+        if title_props:
+            style.configure('Title.TLabel', background=palette['panel_bg'], foreground=title_props.get('foreground', palette['text_fg']), font=self._font_from_css(title_props))
+
+        control_props = _get_props('.control-label')
+        if control_props:
+            style.configure('Control.TLabel', background=palette['panel_bg'], foreground=control_props.get('foreground', palette['text_fg']), font=self._font_from_css(control_props))
+
+        desc_props = _get_props('.description')
+        if desc_props:
+            style.configure('Description.TLabel', background=palette['panel_bg'], foreground=desc_props.get('foreground', palette['muted_fg']), font=self._font_from_css(desc_props))
+
+        style.configure('Entry.TEntry', fieldbackground=palette['entry_bg'], foreground=palette['entry_fg'], font=('Segoe UI', 10))
+        style.map('Entry.TEntry', fieldbackground=[('active', palette['entry_active_bg'])], foreground=[('disabled', '#888888')])
+
+        style.configure('Primary.TButton', background='#f2b24d', foreground='#16110c', font=('Segoe UI', 10, 'bold'), padding=(8, 10))
+        style.map('Primary.TButton', background=[('active', '#7fa4e5'), ('pressed', '#6d8ed0')], foreground=[('active', '#ffffff'), ('pressed', '#ffffff')])
+
+        style.configure('Secondary.TButton', background=palette['button_bg'], foreground=palette['button_fg'], font=('Segoe UI', 10, 'bold'), padding=(8, 10))
+        style.map('Secondary.TButton', background=[('active', palette['button_active_bg']), ('pressed', palette['button_active_bg'])], foreground=[('active', palette['button_active_fg']), ('pressed', palette['button_active_fg'])])
+
+        style.configure('Run.TButton', background='#2f8f45', foreground='#f7fbf2', font=('Segoe UI', 10, 'bold'), padding=(8, 10))
+        style.map('Run.TButton', background=[('active', '#3fae56'), ('pressed', '#287635')], foreground=[('active', '#ffffff'), ('pressed', '#ffffff')])
+
+        style.configure('Status.TLabel', background=palette['panel_bg'], foreground=palette['text_fg'], font=('Segoe UI', 10, 'bold'))
+        style.configure('TProgressbar', background=palette['progress_fg'], troughcolor=palette['progress_bg'])
+
+        style.configure('TFrame', background=palette['panel_bg'])
+        style.configure('TLabel', background=palette['panel_bg'], foreground=palette['text_fg'], font=('Segoe UI', 10))
+        style.configure('TEntry', fieldbackground=palette['entry_bg'], foreground=palette['entry_fg'])
+        style.map('TEntry', fieldbackground=[('active', palette['entry_active_bg'])], foreground=[('disabled', '#888888')])
+        style.configure('TButton', background=palette['button_bg'], foreground=palette['button_fg'], font=('Segoe UI', 10, 'bold'))
+        style.map('TButton', background=[('active', palette['button_active_bg'])], foreground=[('disabled', '#888888')])
+        style.configure('TCheckbutton', background=palette['panel_bg'], foreground=palette['text_fg'], font=('Segoe UI', 10))
+        style.map('TCheckbutton', background=[('active', palette['check_hover_bg'])], foreground=[('active', palette['check_hover_fg']), ('selected', palette['text_fg'])])
+        style.configure('TScrollbar', background=palette['button_bg'], troughcolor=palette['panel_bg'])
+
+        if hasattr(self, 'log'):
+            self.log.configure(bg=palette['log_bg'], fg=palette['log_fg'], insertbackground=palette['log_fg'], relief='flat')
+        if hasattr(self, 'vividness_canvas'):
+            self.vividness_canvas.configure(bg=palette['canvas_bg'])
+            self._draw_vividness_preview()
+        if hasattr(self, 'controls_content'):
+            self.controls_content.configure(style='Panel.TFrame')
+        self._handle_window_resize()
+
+    def _load_css_rules(self):
+        if not STYLE_PATH.exists():
+            return {}
+        rules = {}
+        current_selector = None
+        for raw_line in STYLE_PATH.read_text(encoding='utf-8').splitlines():
+            line = raw_line.split('//', 1)[0].strip()
+            if not line:
+                continue
+            if line.endswith('{'):
+                current_selector = line[:-1].strip()
+                rules[current_selector] = {}
+            elif line.endswith('}'):
+                current_selector = None
+            elif current_selector and ':' in line:
+                prop, value = [part.strip() for part in line.split(':', 1)]
+                if value.endswith(';'):
+                    value = value[:-1]
+                rules[current_selector][prop] = value
+        return rules
+
+    def _font_from_css(self, props):
+        family = props.get('font-family', 'Segoe UI')
+        size = int(props.get('font-size', '10'))
+        weight = props.get('font-weight', 'normal').lower()
+        if weight == 'bold':
+            return (family, size, 'bold')
+        return (family, size)
 
     def _pick_input(self):
         path = filedialog.askopenfilename(filetypes=[('Video files', '*.mp4 *.mov *.mkv *.avi *.webm *.m4v')])
         if path:
             self.input_var.set(path)
+            self.input_duration_var.set(self._get_video_duration(path))
 
     def _pick_output(self):
         path = filedialog.asksaveasfilename(defaultextension='.mp4', filetypes=[('MP4', '*.mp4'), ('WebM', '*.webm')])
         if path:
             self.output_var.set(path)
 
+    def _format_duration(self, seconds):
+        try:
+            total = max(0, int(float(seconds)))
+        except (TypeError, ValueError):
+            return 'Duration unavailable'
+        hours, remainder = divmod(total, 3600)
+        minutes, secs = divmod(remainder, 60)
+        if hours:
+            return f'Length: {hours:d}:{minutes:02d}:{secs:02d}'
+        return f'Length: {minutes:d}:{secs:02d}'
+
+    def _get_video_duration(self, path):
+        if not path:
+            return ''
+        ffprobe = shutil.which('ffprobe')
+        if not ffprobe:
+            return 'Duration unavailable'
+        try:
+            result = subprocess.run(
+                [ffprobe, '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', path],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if result.returncode != 0 or not result.stdout.strip():
+                return 'Duration unavailable'
+            return self._format_duration(result.stdout.strip())
+        except Exception:
+            return 'Duration unavailable'
+
     def _build_group_controls(self, group, items):
-        for index, item in enumerate(items):
+        for item in items:
             label = item['label']
             variable = item['variable']
             kind = item.get('kind', 'slider')
 
             row = ttk.Frame(group)
             row.pack(fill='x', pady=(4, 2))
-            ttk.Label(row, text=label, width=24, anchor='w').pack(side='left')
+            row.columnconfigure(1, weight=1)
+            ttk.Label(row, text=label, width=18, anchor='w').grid(row=0, column=0, sticky='w', padx=(0, 8))
 
             if kind == 'entry':
-                ttk.Entry(row, textvariable=variable, width=18).pack(side='left', padx=(8, 6))
+                ttk.Entry(row, textvariable=variable, width=16).grid(row=0, column=1, sticky='ew', padx=(0, 6))
             else:
                 scale = ttk.Scale(row, from_=item['from_'], to=item['to'], orient='horizontal')
-                scale.pack(side='left', fill='x', expand=True, padx=(8, 6))
+                scale.grid(row=0, column=1, sticky='ew', padx=(0, 6))
                 value_var = tk.StringVar(value=self._format_slider_value(variable.get(), item['step']))
                 scale.set(float(variable.get()))
                 scale.configure(command=lambda value, var=variable, disp=value_var, step=item['step']: self._set_slider_value(value, var, disp, step))
                 self._set_slider_value(scale.get(), variable, value_var, item['step'])
-                ttk.Label(row, textvariable=value_var, width=8, anchor='e').pack(side='left')
+                ttk.Label(row, textvariable=value_var, width=8, anchor='e').grid(row=0, column=2, sticky='e')
 
             description = item.get('description', '')
             if description:
-                ttk.Label(group, text=description, foreground='#666', wraplength=360, justify='left').pack(fill='x', padx=(24, 0), pady=(0, 4))
+                desc_label = ttk.Label(group, text=description, foreground='#666', wraplength=320, justify='left')
+                desc_label.pack(fill='x', padx=(24, 0), pady=(0, 4))
+                self._description_labels.append(desc_label)
 
     def _toggle_group(self, name, expanded):
         group = self.group_frames.get(name)
@@ -469,6 +700,14 @@ class MemoryMoshApp(tk.Tk):
                 child.pack(fill='x') if child.winfo_manager() == 'pack' else None
             else:
                 child.pack_forget()
+
+    def _handle_window_resize(self, event=None):
+        if not hasattr(self, '_description_labels'):
+            return
+        width = max(280, self.winfo_width() - 180)
+        for label in self._description_labels:
+            if label.winfo_exists():
+                label.configure(wraplength=max(220, width))
 
     def _format_slider_value(self, value, step):
         try:
@@ -495,28 +734,32 @@ class MemoryMoshApp(tk.Tk):
         variable.set(text)
         display_var.set(text)
 
-    def _draw_vividness_preview(self):
+    def _draw_vividness_preview(self, event=None):
         self.vividness_canvas.delete('all')
-        width = 320
+        width = event.width if event is not None else self.vividness_canvas.winfo_width()
+        width = max(1, int(width if width > 1 else 320))
         height = 90
         mid_y = height / 2
         cycles = float(self.cycles_var.get())
         motion_weight = float(self.motion_weight_var.get())
         audio_weight = float(self.audio_weight_var.get())
-        self.vividness_canvas.create_rectangle(0, 0, width, height, fill='#1b1a18', outline='')
-        self.vividness_canvas.create_line(10, mid_y, width - 10, mid_y, fill='#4f4b42', width=1)
-        for i in range(0, width - 20, 8):
-            t = i / max(width - 20, 1)
-            base = 0.5 + 0.5 * math.sin(2 * math.pi * cycles * t)
-            motion_bias = 0.5 + 0.5 * math.sin(2 * math.pi * 0.35 * (i / 10))
-            audio_bias = 0.5 + 0.5 * math.sin(2 * math.pi * 0.15 * (i / 10) + 1.2)
-            value = clamp((1 - motion_weight - audio_weight) * base + motion_weight * motion_bias + audio_weight * audio_bias)
-            px = 10 + i
+
+        sample_count = max(24, min(96, width // 6))
+        motion_energy = [0.5 + 0.5 * math.sin(2.0 * math.pi * 0.35 * (i / 8.0)) for i in range(sample_count)]
+        audio_energy = [0.5 + 0.5 * math.sin(2.0 * math.pi * 0.15 * (i / 10.0) + 1.2) for i in range(sample_count)]
+        curve = build_vividness_curve(sample_count, motion_energy=motion_energy, audio_energy=audio_energy,
+                                      cycles=cycles, motion_weight=motion_weight, audio_weight=audio_weight)
+
+        palette = THEMES.get(self.theme_var.get(), THEMES['dark'])
+        self.vividness_canvas.create_rectangle(0, 0, width, height, fill=palette['canvas_bg'], outline='')
+        self.vividness_canvas.create_line(10, mid_y, width - 10, mid_y, fill=palette['curve_line'], width=1)
+        for idx, value in enumerate(curve):
+            px = 10 + int(idx * (width - 20) / max(len(curve) - 1, 1))
             py = mid_y - (value - 0.5) * 28
-            color = '#f0c36d' if value > 0.65 else '#8b6f47'
+            color = palette['curve_peak'] if value > 0.65 else palette['curve_low']
             self.vividness_canvas.create_oval(px - 2, py - 2, px + 2, py + 2, fill=color, outline='')
-        self.vividness_canvas.create_text(20, 72, anchor='nw', text='loop-safe vividness', fill='#d9d2c3', font=('Helvetica', 9))
-        self.vividness_canvas.create_text(180, 72, anchor='nw', text='motion-biased', fill='#8b6f47', font=('Helvetica', 9))
+        self.vividness_canvas.create_text(20, 72, anchor='nw', text='curve preview', fill='#d9d2c3', font=('Helvetica', 9))
+        self.vividness_canvas.create_text(max(180, width - 140), 72, anchor='nw', text='same curve logic', fill='#8b6f47', font=('Helvetica', 9))
 
     def _animate_vividness_preview(self):
         self._draw_vividness_preview()
@@ -593,7 +836,6 @@ class MemoryMoshApp(tk.Tk):
             'quality': int(float(self.quality_var.get())),
             'seed': int(self.seed_var.get()) if self.seed_var.get() else None,
             'keep_intermediate': False,
-            'preview_duration': int(float(self.preview_var.get())),
         }
 
     def _run_pipeline(self):

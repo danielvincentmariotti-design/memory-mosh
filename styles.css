@@ -1,0 +1,96 @@
+.root {
+  background: #121721;
+  foreground: #f2ecdf;
+  font-family: Segoe UI;
+  font-size: 10;
+}
+
+.panel {
+  background: #161c28;
+  foreground: #f2ecdf;
+}
+
+.section {
+  background: #1a2130;
+  foreground: #f2ecdf;
+  border-color: #37445b;
+}
+
+.title {
+  foreground: #ece5d3;
+  font-family: Segoe UI;
+  font-size: 16;
+  font-weight: bold;
+}
+
+.control-label {
+  foreground: #e7e0d0;
+  font-family: Segoe UI;
+  font-size: 10;
+  font-weight: bold;
+}
+
+.description {
+  foreground: #8e99aa;
+  font-family: Segoe UI;
+  font-size: 9;
+}
+
+.entry {
+  background: #1a2232;
+  foreground: #f7f2e8;
+  border-color: #4a5a74;
+  font-family: Segoe UI;
+  font-size: 10;
+}
+
+.primary-button {
+  background: #5f7db8;
+  foreground: #f7f4eb;
+  font-family: Segoe UI;
+  font-size: 10;
+  font-weight: bold;
+  padding: 8 10;
+}
+
+.secondary-button {
+  background: #354152;
+  foreground: #f7f4eb;
+  font-family: Segoe UI;
+  font-size: 10;
+  font-weight: bold;
+  padding: 8 10;
+}
+
+.run-button {
+  background: #2f8f45;
+  foreground: #f7fbf2;
+  font-family: Segoe UI;
+  font-size: 10;
+  font-weight: bold;
+  padding: 8 10;
+}
+
+.status {
+  foreground: #ece5d3;
+  font-family: Segoe UI;
+  font-size: 10;
+  font-weight: bold;
+}
+
+.progress {
+  background: #202838;
+  foreground: #8cbf8d;
+}
+
+.log {
+  background: #0f141d;
+  foreground: #f2ecdf;
+  border-color: #2f394b;
+  font-family: Consolas;
+  font-size: 9;
+}
+
+.canvas {
+  background: #121721;
+}
