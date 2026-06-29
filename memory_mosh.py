@@ -26,6 +26,8 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+
+TEMP_ROOT = Path(__file__).resolve().parent / 'temp'
 from tkinter import filedialog, messagebox, ttk
 import tkinter as tk
 from tkinter import Scrollbar
@@ -118,12 +120,15 @@ THEMES = {
 
 
 def run_ffmpeg(args, label):
-    cmd = ['ffmpeg', '-y', *args]
+    cmd = ['ffmpeg', '-y', '-nostdin', *args]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        print(f'\n--- ffmpeg failed during: {label} ---', file=sys.stderr)
-        print(result.stderr[-2000:], file=sys.stderr)
-        sys.exit(1)
+        details = (result.stderr or result.stdout or '').strip()
+        preview = details[-2000:] if details else 'No ffmpeg output was returned.'
+        lowered = preview.lower()
+        if 'no space left on device' in lowered or 'not enough space' in lowered:
+            raise RuntimeError(f'ffmpeg failed during {label}: disk space or temp-file write issue. {preview}')
+        raise RuntimeError(f'ffmpeg failed during {label}: {preview}')
 
 
 def build_preview_ffmpeg_args(input_path, output_path, duration=20):
@@ -220,7 +225,8 @@ def _read_pgm(path):
 
 
 def analyze_motion_energy(input_path, target_length, analysis_fps=4.0, size=64):
-    analysis_dir = Path(tempfile.mkdtemp(prefix='memory-mosh-analysis-'))
+    TEMP_ROOT.mkdir(parents=True, exist_ok=True)
+    analysis_dir = Path(tempfile.mkdtemp(prefix='memory-mosh-analysis-', dir=str(TEMP_ROOT)))
     try:
         frame_count = max(8, min(96, target_length))
         run_ffmpeg([
@@ -306,7 +312,8 @@ def run_pipeline(config, progress_callback=None):
     if not in_path.exists():
         raise FileNotFoundError(f'input file not found: {in_path}')
 
-    workdir = Path(tempfile.mkdtemp(prefix='memory-mosh-')) if not config.get('keep_intermediate', False) else out_path.parent
+    TEMP_ROOT.mkdir(parents=True, exist_ok=True)
+    workdir = Path(tempfile.mkdtemp(prefix='memory-mosh-', dir=str(TEMP_ROOT))) if not config.get('keep_intermediate', False) else out_path.parent
     raw_avi = workdir / f'{in_path.stem}_raw.avi'
     moshed_avi = workdir / f'{in_path.stem}_moshed.avi'
 
@@ -870,8 +877,14 @@ class MemoryMoshApp(tk.Tk):
 
     def _fail_run(self, exc):
         self.status_var.set('Failed')
-        self._append_log(f'Error: {exc}')
-        messagebox.showerror('Render failed', str(exc))
+        if isinstance(exc, MemoryError):
+            message = 'The render ran out of memory while processing the video.'
+        else:
+            message = str(exc) if str(exc).strip() else repr(exc)
+        self._append_log(f'Error: {message}')
+        if not message.strip():
+            message = 'The render failed, but no detailed error message was returned.'
+        messagebox.showerror('Render failed', message)
 
 
 def parse_args(argv=None):

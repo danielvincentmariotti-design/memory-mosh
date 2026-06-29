@@ -1,6 +1,6 @@
 import unittest
 
-from memory_mosh import build_preview_ffmpeg_args, build_vividness_curve, rate_from_curve
+from memory_mosh import build_preview_ffmpeg_args, build_vividness_curve, rate_from_curve, run_ffmpeg
 
 
 class VividnessCurveTests(unittest.TestCase):
@@ -21,6 +21,11 @@ class VividnessCurveTests(unittest.TestCase):
         self.assertIn('-t', args)
         self.assertIn('20', args)
         self.assertTrue(args[-1].endswith('preview.mp4'))
+
+    def test_run_ffmpeg_raises_runtime_error_on_failure(self):
+        with self.assertRaises(RuntimeError) as ctx:
+            run_ffmpeg(['-i', 'does-not-exist.mp4', 'out.mp4'], 'test')
+        self.assertIn('ffmpeg failed during test', str(ctx.exception))
 
 
 if __name__ == '__main__':
