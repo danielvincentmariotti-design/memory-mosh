@@ -20,6 +20,9 @@ output/
 outputs/
 raw/
 
+# Scratch/test renders and throwaway spike scripts, not project code
+spike/
+
 # Local env / editor files
 .vscode/
 .DS_Store

@@ -41,6 +41,7 @@ except ImportError:
     PIL = None
 
 import avimosh
+import pixelsort
 from avimosh import rate_from_curve
 
 THEMES = {
@@ -67,6 +68,7 @@ THEMES = {
         'curve_line': '#4f4b42',
         'curve_peak': '#f0c36d',
         'curve_low': '#8b6f47',
+        'forget_curve': '#6fb3d9',
     },
     'light': {
         'root_bg': '#f3f5f9',
@@ -91,6 +93,7 @@ THEMES = {
         'curve_line': '#c2b8a3',
         'curve_peak': '#d08c2f',
         'curve_low': '#9b7b4c',
+        'forget_curve': '#3f7fbf',
     },
     'ember': {
         'root_bg': '#19131a',
@@ -115,6 +118,7 @@ THEMES = {
         'curve_line': '#705650',
         'curve_peak': '#f0b25d',
         'curve_low': '#8c5a3d',
+        'forget_curve': '#4fb3a6',
     },
 }
 
@@ -133,6 +137,51 @@ def run_ffmpeg(args, label):
 
 def build_preview_ffmpeg_args(input_path, output_path, duration=20):
     return ['-i', str(input_path), '-t', str(duration), '-c:v', 'libx264', '-pix_fmt', 'yuv420p', str(output_path)]
+
+
+def _probe_fps(path):
+    ffprobe = shutil.which('ffprobe')
+    if not ffprobe:
+        return 30.0
+    result = subprocess.run(
+        [ffprobe, '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=r_frame_rate',
+         '-of', 'default=noprint_wrappers=1:nokey=1', str(path)],
+        capture_output=True, text=True,
+    )
+    value = result.stdout.strip()
+    if not value:
+        return 30.0
+    if '/' in value:
+        num, den = value.split('/')
+        den = float(den)
+        return float(num) / den if den else 30.0
+    return float(value)
+
+
+def apply_temporal_blend(input_path, output_path, mode='blend'):
+    """Motion-aware smoothing via ffmpeg's minterpolate, run at the source's
+    own frame rate (not up- or down-sampling fps) so it fills in
+    duplicate/frozen stretches with motion-estimated content instead of
+    just passing the same frames through untouched. scd=none matters: without
+    it, minterpolate's scene-change detector treats the mosh's own frame
+    jumps (keyframe removal, a freeze ending) as real cuts and skips
+    interpolating exactly the frames we want smoothed.
+
+    mode='blend': motion-compensated blending, gentler, cheaper.
+    mode='motion': full motion-compensated interpolation (mi_mode=mci) —
+    stronger smoothing, more likely to warp/ghost around the harshest jumps
+    since it's more aggressively guessing at motion that isn't really there.
+    """
+    fps = _probe_fps(input_path)
+    mi_mode = 'mci' if mode == 'motion' else 'blend'
+    vf = f'minterpolate=fps={fps}:mi_mode={mi_mode}:scd=none'
+    if mi_mode == 'mci':
+        vf += ':mc_mode=aobmc:me_mode=bidir:vsbmc=1'
+    if Path(output_path).suffix.lower() == '.webm':
+        codec_args = ['-c:v', 'libvpx-vp9', '-crf', '30', '-b:v', '0']
+    else:
+        codec_args = ['-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-crf', '18']
+    run_ffmpeg(['-i', str(input_path), '-vf', vf, *codec_args, str(output_path)], 'temporal-blend')
 
 
 def build_preview_config(config, preview_duration):
@@ -189,6 +238,32 @@ def build_vividness_curve(length, motion_energy=None, audio_energy=None,
         curve.append(clamp(blended))
 
     curve[0] = curve[-1] = (curve[0] + curve[-1]) / 2.0
+    return curve
+
+
+def forgetting_curve_retention(t, k=1.84, c=1.25):
+    """Power-law retention model: b = 100k / ((log t)^c + k).
+    t is 'time since the memory was formed', t >= 1 (so log t >= 0 and the
+    fractional power stays real). Returns retention normalized to 0-1
+    (1.0 at t=1, decaying toward 0 as t grows)."""
+    t = max(1.0, t)
+    denom = (math.log(t)) ** c + k
+    return (100.0 * k / denom) / 100.0 if denom > 0 else 0.0
+
+
+def build_forgetting_curve(length, cycles=1.5, k=1.84, c=1.25, t_max=60.0):
+    """Same cyclical rhythm as the vividness curve (same 'cycles' count),
+    but each cycle is a fresh memory event: retention resets to 1.0 at the
+    start of every cycle and decays per forgetting_curve_retention across
+    it, rather than following a sine wave."""
+    if length <= 1:
+        return [1.0]
+    curve = []
+    for i in range(length):
+        t_norm = i / max(length - 1, 1)
+        cycle_frac = (cycles * t_norm) % 1.0
+        t_model = 1.0 + cycle_frac * (t_max - 1.0)
+        curve.append(forgetting_curve_retention(t_model, k=k, c=c))
     return curve
 
 
@@ -317,16 +392,30 @@ def run_pipeline(config, progress_callback=None):
     raw_avi = workdir / f'{in_path.stem}_raw.avi'
     moshed_avi = workdir / f'{in_path.stem}_moshed.avi'
 
+    # Stage checkpoints for the overall progress bar. Pixel-sort and the
+    # temporal blend (when enabled) are the slowest/last stages, so they
+    # split the back end of the bar, weighted toward pixel-sort since it's
+    # by far the more expensive of the two.
+    pixel_sort_enabled = config.get('pixel_sort_enabled', False)
+    temporal_blend_enabled = config.get('temporal_blend_enabled', False)
+    extra_stage_weights = []
+    if pixel_sort_enabled:
+        extra_stage_weights.append(0.75)
+    if temporal_blend_enabled:
+        extra_stage_weights.append(0.25)
+    reencode_end = 0.55 if extra_stage_weights else 0.95
+    total_extra_weight = sum(extra_stage_weights) or 1.0
+
     source_path = in_path
     if config.get('preview_duration'):
         preview_path = workdir / f'{in_path.stem}_preview.mp4'
         if progress_callback:
-            progress_callback(f'Creating a {config["preview_duration"]}s preview clip…')
+            progress_callback(f'Creating a {config["preview_duration"]}s preview clip…', 0.02)
         run_ffmpeg(['-i', str(in_path), '-t', str(config['preview_duration']), '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-an', str(preview_path)], 'preview-trim')
         source_path = preview_path
 
     if progress_callback:
-        progress_callback('Transcoding to a raw AVI/mpeg4 intermediate…')
+        progress_callback('Transcoding to a raw AVI/mpeg4 intermediate…', 0.05)
     run_ffmpeg(['-i', str(source_path), '-c:v', 'mpeg4', '-g', '9999', '-bf', '0',
                 '-q:v', str(config['quality']), '-an', str(raw_avi)], 'transcode')
 
@@ -337,7 +426,7 @@ def run_pipeline(config, progress_callback=None):
     vividness_curve = None
     if config.get('use_vividness_curve', False):
         if progress_callback:
-            progress_callback('Analyzing motion into a vividness curve…')
+            progress_callback('Analyzing motion into a vividness curve…', 0.15)
         vividness_curve = analyze_vividness_curve(
             in_path,
             target_length=frame_count,
@@ -349,7 +438,7 @@ def run_pipeline(config, progress_callback=None):
         )
 
     if progress_callback:
-        progress_callback('Removing keyframes and duplicating delta frames…')
+        progress_callback('Removing keyframes and duplicating delta frames…', 0.25)
     stats = avimosh.mosh_file(
         str(raw_avi), str(moshed_avi),
         keyframe_removal_rate=config['keyframe_removal_rate'],
@@ -362,12 +451,56 @@ def run_pipeline(config, progress_callback=None):
     )
 
     if progress_callback:
-        progress_callback('Re-encoding to a shareable output file…')
+        progress_callback('Re-encoding to a shareable output file…', reencode_end * 0.8)
     if out_path.suffix.lower() == '.webm':
         codec_args = ['-c:v', 'libvpx-vp9', '-crf', '30', '-b:v', '0']
     else:
         codec_args = ['-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-crf', '18']
     run_ffmpeg(['-i', str(moshed_avi), *codec_args, str(out_path)], 're-encode')
+
+    stage_cursor = reencode_end
+
+    if pixel_sort_enabled:
+        stage_start = stage_cursor
+        stage_end = stage_start + (0.98 - reencode_end) * (0.75 / total_extra_weight)
+        stage_cursor = stage_end
+
+        if progress_callback:
+            progress_callback('Pixel sorting the moshed output…', stage_start)
+        pixelsort_input = workdir / f'{in_path.stem}_pre_pixelsort{out_path.suffix}'
+        shutil.move(str(out_path), str(pixelsort_input))
+
+        def _pixelsort_progress(message, fraction=None, _start=stage_start, _end=stage_end):
+            if progress_callback:
+                overall = _start + (_end - _start) * (fraction if fraction is not None else 0.0)
+                progress_callback(message, overall)
+
+        forgetting_curve = None
+        if config.get('use_vividness_curve', False):
+            forgetting_curve = build_forgetting_curve(frame_count, cycles=config.get('curve_cycles', 1.5))
+
+        pixelsort.pixel_sort_video(
+            pixelsort_input, out_path,
+            direction=config.get('pixel_sort_direction', 'both'),
+            aggression=config.get('pixel_sort_aggression', 0.5),
+            key=config.get('pixel_sort_key', 'brightness'),
+            temp_root=TEMP_ROOT,
+            progress_callback=_pixelsort_progress,
+            decay_curve=forgetting_curve,
+        )
+
+    if temporal_blend_enabled:
+        stage_start = stage_cursor
+        stage_end = stage_start + (0.98 - reencode_end) * (0.25 / total_extra_weight)
+        stage_cursor = stage_end
+
+        if progress_callback:
+            progress_callback('Smoothing with a temporal blend…', stage_start)
+        blend_input = workdir / f'{in_path.stem}_pre_blend{out_path.suffix}'
+        shutil.move(str(out_path), str(blend_input))
+        apply_temporal_blend(blend_input, out_path, mode=config.get('temporal_blend_mode', 'blend'))
+        if progress_callback:
+            progress_callback('Temporal blend complete.', stage_end)
 
     if not config.get('keep_intermediate', False):
         shutil.rmtree(workdir, ignore_errors=True)
@@ -403,6 +536,12 @@ class MemoryMoshApp(tk.Tk):
         self.quality_var = tk.StringVar(value='3')
         self.seed_var = tk.StringVar(value='')
         self.preview_var = tk.StringVar(value='15')
+        self.pixel_sort_var = tk.BooleanVar(value=False)
+        self.pixel_sort_direction_var = tk.StringVar(value='both')
+        self.pixel_sort_aggression_var = tk.StringVar(value='0.5')
+        self.pixel_sort_key_var = tk.StringVar(value='brightness')
+        self.temporal_blend_var = tk.BooleanVar(value=False)
+        self.temporal_blend_mode_var = tk.StringVar(value='blend')
         self.theme_var = tk.StringVar(value='dark')
         self._description_labels = []
 
@@ -459,6 +598,8 @@ class MemoryMoshApp(tk.Tk):
         checkbox_row.columnconfigure(1, weight=1)
         ttk.Checkbutton(checkbox_row, text='Use vividness curve', variable=self.use_curve_var).grid(row=0, column=0, sticky='w', padx=(0, 16))
         ttk.Checkbutton(checkbox_row, text='Analyze audio energy', variable=self.audio_var).grid(row=0, column=1, sticky='w')
+        ttk.Checkbutton(checkbox_row, text='Pixel sort (post-process)', variable=self.pixel_sort_var).grid(row=1, column=0, sticky='w', padx=(0, 16), pady=(4, 0))
+        ttk.Checkbutton(checkbox_row, text='Smooth (motion interpolation)', variable=self.temporal_blend_var).grid(row=1, column=1, sticky='w', pady=(4, 0))
 
         effect_groups = [
             ('Curve', [
@@ -480,6 +621,32 @@ class MemoryMoshApp(tk.Tk):
                 {'label': 'Preview duration (s)', 'variable': self.preview_var, 'from_': 5, 'to': 30, 'step': 1, 'description': 'How long the preview export should be.'},
                 {'label': 'Seed', 'variable': self.seed_var, 'kind': 'entry', 'description': 'Optional random seed for repeatable glitches.'},
             ], 15),
+            ('Pixel Sort', [
+                {'label': 'Direction', 'variable': self.pixel_sort_direction_var, 'kind': 'combo',
+                 'values': ['rows', 'cols', 'both'],
+                 'description': 'Which axis pixel runs get sorted along. "both" compounds rows then columns.'},
+                {'label': 'Sort key', 'variable': self.pixel_sort_key_var, 'kind': 'combo',
+                 'values': ['brightness', 'hue', 'saturation', 'lightness'],
+                 'description': 'What property decides which pixels are eligible and how they get ordered. '
+                                'Brightness: classic streaks, follows light/dark areas. Hue: sorts by color angle — '
+                                'shifts drift through the rainbow rather than light/dark. Saturation: separates vivid '
+                                'color from washed-out/gray areas. Lightness: brightness-like but color-neutral (HSL), '
+                                'a subtler variant of brightness.'},
+                {'label': 'Aggression', 'variable': self.pixel_sort_aggression_var, 'from_': 0.0, 'to': 1.0, 'step': 0.05,
+                 'description': 'How wide the sort-key window is that gets sorted. Higher = more of the frame dissolves. '
+                                'Acts as a ceiling when "Use vividness curve" is on: low-vividness (forgotten) moments dissolve '
+                                'toward this value, vivid moments stay close to clean.'},
+            ], 19),
+            ('Smoothing', [
+                {'label': 'Smooth mode', 'variable': self.temporal_blend_mode_var, 'kind': 'combo',
+                 'values': ['blend', 'motion'],
+                 'description': 'Runs last, after everything else. Motion-aware (ffmpeg minterpolate), not a simple '
+                                'average — it estimates motion and fills in duplicate/frozen stretches instead of just '
+                                'blurring around them. "blend": gentler motion-compensated blending. "motion": full '
+                                'motion-compensated interpolation — smooths harder, but more likely to warp/ghost around '
+                                'the sharpest jumps (a keyframe removal, a freeze ending) since it tries harder to guess '
+                                'motion that isn\'t really there.'},
+            ], 22),
         ]
 
         self.group_frames = {}
@@ -494,6 +661,8 @@ class MemoryMoshApp(tk.Tk):
         self._toggle_group('Curve', True)
         self._toggle_group('Mosh', True)
         self._toggle_group('Output', True)
+        self._toggle_group('Pixel Sort', True)
+        self._toggle_group('Smoothing', True)
 
         self.controls_content = ttk.Frame(frame)
         self.controls_content.grid(row=23, column=0, columnspan=3, sticky='nsew', pady=(8, 0))
@@ -683,6 +852,9 @@ class MemoryMoshApp(tk.Tk):
 
             if kind == 'entry':
                 ttk.Entry(row, textvariable=variable, width=16).grid(row=0, column=1, sticky='ew', padx=(0, 6))
+            elif kind == 'combo':
+                combo = ttk.Combobox(row, textvariable=variable, values=item['values'], state='readonly', width=14)
+                combo.grid(row=0, column=1, sticky='w', padx=(0, 6))
             else:
                 scale = ttk.Scale(row, from_=item['from_'], to=item['to'], orient='horizontal')
                 scale.grid(row=0, column=1, sticky='ew', padx=(0, 6))
@@ -756,30 +928,43 @@ class MemoryMoshApp(tk.Tk):
         audio_energy = [0.5 + 0.5 * math.sin(2.0 * math.pi * 0.15 * (i / 10.0) + 1.2) for i in range(sample_count)]
         curve = build_vividness_curve(sample_count, motion_energy=motion_energy, audio_energy=audio_energy,
                                       cycles=cycles, motion_weight=motion_weight, audio_weight=audio_weight)
+        forget_curve = build_forgetting_curve(sample_count, cycles=cycles)
 
         palette = THEMES.get(self.theme_var.get(), THEMES['dark'])
         self.vividness_canvas.create_rectangle(0, 0, width, height, fill=palette['canvas_bg'], outline='')
         self.vividness_canvas.create_line(10, mid_y, width - 10, mid_y, fill=palette['curve_line'], width=1)
-        for idx, value in enumerate(curve):
-            px = 10 + int(idx * (width - 20) / max(len(curve) - 1, 1))
+
+        def _point(idx, value, count):
+            px = 10 + int(idx * (width - 20) / max(count - 1, 1))
             py = mid_y - (value - 0.5) * 28
+            return px, py
+
+        forget_points = [coord for idx, value in enumerate(forget_curve) for coord in _point(idx, value, len(forget_curve))]
+        if len(forget_points) >= 4:
+            self.vividness_canvas.create_line(*forget_points, fill=palette['forget_curve'], width=2, smooth=True)
+
+        for idx, value in enumerate(curve):
+            px, py = _point(idx, value, len(curve))
             color = palette['curve_peak'] if value > 0.65 else palette['curve_low']
             self.vividness_canvas.create_oval(px - 2, py - 2, px + 2, py + 2, fill=color, outline='')
-        self.vividness_canvas.create_text(20, 72, anchor='nw', text='curve preview', fill='#d9d2c3', font=('Helvetica', 9))
-        self.vividness_canvas.create_text(max(180, width - 140), 72, anchor='nw', text='same curve logic', fill='#8b6f47', font=('Helvetica', 9))
+
+        self.vividness_canvas.create_text(20, 72, anchor='nw', text='● vividness (motion + wave)', fill=palette['curve_peak'], font=('Helvetica', 9))
+        self.vividness_canvas.create_text(max(180, width - 170), 72, anchor='nw', text='— forgetting curve (power-law)', fill=palette['forget_curve'], font=('Helvetica', 9))
 
     def _animate_vividness_preview(self):
         self._draw_vividness_preview()
         self.after(120, self._animate_vividness_preview)
 
-    def _append_log(self, message):
-        self.after(0, lambda: self._append_log_now(message))
+    def _append_log(self, message, fraction=None):
+        self.after(0, lambda: self._append_log_now(message, fraction))
 
-    def _append_log_now(self, message):
+    def _append_log_now(self, message, fraction=None):
         self.log.configure(state='normal')
         self.log.insert('end', message + '\n')
         self.log.see('end')
         self.log.configure(state='disabled')
+        if fraction is not None:
+            self.progress_var.set(max(0.0, min(100.0, fraction * 100.0)))
 
     def _run_preview(self):
         if not self.input_var.get():
@@ -843,6 +1028,12 @@ class MemoryMoshApp(tk.Tk):
             'quality': int(float(self.quality_var.get())),
             'seed': int(self.seed_var.get()) if self.seed_var.get() else None,
             'keep_intermediate': False,
+            'pixel_sort_enabled': bool(self.pixel_sort_var.get()),
+            'pixel_sort_direction': self.pixel_sort_direction_var.get(),
+            'pixel_sort_key': self.pixel_sort_key_var.get(),
+            'pixel_sort_aggression': float(self.pixel_sort_aggression_var.get()),
+            'temporal_blend_enabled': bool(self.temporal_blend_var.get()),
+            'temporal_blend_mode': self.temporal_blend_mode_var.get(),
         }
 
     def _run_pipeline(self):
@@ -911,6 +1102,19 @@ def parse_args(argv=None):
     p.add_argument('--motion-weight', type=float, default=0.55, help='how strongly motion influences the vividness curve')
     p.add_argument('--audio-weight', type=float, default=0.15, help='how strongly audio energy influences the vividness curve')
     p.add_argument('--audio-analysis', action='store_true', help='include audio energy in the vividness curve')
+    p.add_argument('--pixel-sort', dest='pixel_sort_enabled', action='store_true',
+                   help='apply a threshold-interval pixel sort over the moshed output (requires pillow + numpy)')
+    p.add_argument('--pixel-sort-direction', choices=['rows', 'cols', 'both'], default='both',
+                   help='axis to sort pixel runs along (default both: rows then columns)')
+    p.add_argument('--pixel-sort-key', choices=['brightness', 'hue', 'saturation', 'lightness'], default='brightness',
+                   help='pixel property used for eligibility + ordering (default brightness)')
+    p.add_argument('--pixel-sort-aggression', type=float, default=0.5,
+                   help='0-1, how wide the sort-key window is that gets sorted (default 0.5)')
+    p.add_argument('--smooth', dest='temporal_blend_enabled', action='store_true',
+                   help='motion-aware smoothing (ffmpeg minterpolate) to soften stutter/flicker, runs last')
+    p.add_argument('--smooth-mode', choices=['blend', 'motion'], default='blend',
+                   help='"blend": gentler motion-compensated blending. "motion": full motion-compensated '
+                        'interpolation, stronger but more prone to warping around sharp jumps (default blend)')
     return p.parse_args(argv)
 
 
@@ -947,6 +1151,12 @@ def main(argv=None):
         'quality': args.quality,
         'seed': args.seed,
         'keep_intermediate': args.keep_intermediate,
+        'pixel_sort_enabled': args.pixel_sort_enabled,
+        'pixel_sort_direction': args.pixel_sort_direction,
+        'pixel_sort_key': args.pixel_sort_key,
+        'pixel_sort_aggression': args.pixel_sort_aggression,
+        'temporal_blend_enabled': args.temporal_blend_enabled,
+        'temporal_blend_mode': args.smooth_mode,
     }
     result = run_pipeline(config)
     print(f"done -> {result['output_path']}")
