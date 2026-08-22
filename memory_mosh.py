@@ -42,6 +42,7 @@ except ImportError:
 
 import avimosh
 import pixelsort
+import subject_protect
 from avimosh import rate_from_curve
 
 THEMES = {
@@ -392,19 +393,24 @@ def run_pipeline(config, progress_callback=None):
     raw_avi = workdir / f'{in_path.stem}_raw.avi'
     moshed_avi = workdir / f'{in_path.stem}_moshed.avi'
 
-    # Stage checkpoints for the overall progress bar. Pixel-sort and the
-    # temporal blend (when enabled) are the slowest/last stages, so they
-    # split the back end of the bar, weighted toward pixel-sort since it's
-    # by far the more expensive of the two.
+    # Stage checkpoints for the overall progress bar. Subject-protect and
+    # pixel-sort are merged into one 'frame_effects' stage — extract frames
+    # once, apply whichever of the two are enabled in place on the same
+    # files, reassemble once — rather than each doing its own full
+    # encode/decode round trip. Temporal blend (motion interpolation) can't
+    # join that: it's a single ffmpeg filter pass, not a per-frame Python step.
+    STAGE_WEIGHTS = {'frame_effects': 0.85, 'blend': 0.15}
+    subject_protect_enabled = config.get('subject_protect_enabled', False)
     pixel_sort_enabled = config.get('pixel_sort_enabled', False)
     temporal_blend_enabled = config.get('temporal_blend_enabled', False)
-    extra_stage_weights = []
-    if pixel_sort_enabled:
-        extra_stage_weights.append(0.75)
+    frame_effects_enabled = subject_protect_enabled or pixel_sort_enabled
+    extra_stages = []
+    if frame_effects_enabled:
+        extra_stages.append('frame_effects')
     if temporal_blend_enabled:
-        extra_stage_weights.append(0.25)
-    reencode_end = 0.55 if extra_stage_weights else 0.95
-    total_extra_weight = sum(extra_stage_weights) or 1.0
+        extra_stages.append('blend')
+    reencode_end = 0.55 if extra_stages else 0.95
+    total_extra_weight = sum(STAGE_WEIGHTS[s] for s in extra_stages) or 1.0
 
     source_path = in_path
     if config.get('preview_duration'):
@@ -460,39 +466,71 @@ def run_pipeline(config, progress_callback=None):
 
     stage_cursor = reencode_end
 
-    if pixel_sort_enabled:
-        stage_start = stage_cursor
-        stage_end = stage_start + (0.98 - reencode_end) * (0.75 / total_extra_weight)
-        stage_cursor = stage_end
+    def _next_stage_span(name):
+        nonlocal stage_cursor
+        start = stage_cursor
+        end = start + (0.98 - reencode_end) * (STAGE_WEIGHTS[name] / total_extra_weight)
+        stage_cursor = end
+        return start, end
 
-        if progress_callback:
-            progress_callback('Pixel sorting the moshed output…', stage_start)
-        pixelsort_input = workdir / f'{in_path.stem}_pre_pixelsort{out_path.suffix}'
-        shutil.move(str(out_path), str(pixelsort_input))
+    if frame_effects_enabled:
+        stage_start, stage_end = _next_stage_span('frame_effects')
 
-        def _pixelsort_progress(message, fraction=None, _start=stage_start, _end=stage_end):
+        def _frame_progress(message, fraction=None, _start=stage_start, _end=stage_end):
             if progress_callback:
                 overall = _start + (_end - _start) * (fraction if fraction is not None else 0.0)
                 progress_callback(message, overall)
 
-        forgetting_curve = None
-        if config.get('use_vividness_curve', False):
-            forgetting_curve = build_forgetting_curve(frame_count, cycles=config.get('curve_cycles', 1.5))
+        frames_input = workdir / f'{in_path.stem}_pre_frame_effects{out_path.suffix}'
+        shutil.move(str(out_path), str(frames_input))
 
-        pixelsort.pixel_sort_video(
-            pixelsort_input, out_path,
-            direction=config.get('pixel_sort_direction', 'both'),
-            aggression=config.get('pixel_sort_aggression', 0.5),
-            key=config.get('pixel_sort_key', 'brightness'),
-            temp_root=TEMP_ROOT,
-            progress_callback=_pixelsort_progress,
-            decay_curve=forgetting_curve,
-        )
+        fps = _probe_fps(frames_input)
+        frames_dir = workdir / 'frame_effects_frames'
+        _frame_progress('Extracting frames for subject-protect/pixel-sort…', 0.0)
+        frame_paths = pixelsort.extract_frames(frames_input, frames_dir, label='frame-effects-extract')
+
+        # Sub-spans within this stage's local [0, 1] fraction — extraction
+        # and reassembly get small fixed slices, the rest is split between
+        # whichever of protect/pixel-sort are actually enabled.
+        cursor = 0.05
+
+        if subject_protect_enabled:
+            clean_frames_dir = workdir / 'frame_effects_clean'
+            _frame_progress('Subject protect: extracting clean source frames…', cursor)
+            clean_frame_paths = pixelsort.extract_frames(
+                source_path, clean_frames_dir, label='frame-effects-extract-clean')
+
+            protect_end = cursor + (0.45 if pixel_sort_enabled else 0.85)
+            subject_protect.composite_frames_in_place(
+                frame_paths, clean_frame_paths,
+                channel=config.get('subject_protect_channel', 'hue'),
+                low=config.get('subject_protect_low', 0.0),
+                high=config.get('subject_protect_high', 60.0),
+                progress_callback=_frame_progress, progress_start=cursor, progress_end=protect_end,
+            )
+            cursor = protect_end
+
+        if pixel_sort_enabled:
+            forgetting_curve = None
+            if config.get('use_vividness_curve', False):
+                forgetting_curve = build_forgetting_curve(frame_count, cycles=config.get('curve_cycles', 1.5))
+
+            sort_end = 0.9
+            pixelsort.sort_frames_in_place(
+                frame_paths,
+                direction=config.get('pixel_sort_direction', 'both'),
+                aggression=config.get('pixel_sort_aggression', 0.5),
+                key=config.get('pixel_sort_key', 'brightness'),
+                decay_curve=forgetting_curve,
+                progress_callback=_frame_progress, progress_start=cursor, progress_end=sort_end,
+            )
+            cursor = sort_end
+
+        _frame_progress('Re-assembling video…', 0.95)
+        pixelsort.reassemble_frames(frames_dir, fps, out_path, label='frame-effects-reassemble')
 
     if temporal_blend_enabled:
-        stage_start = stage_cursor
-        stage_end = stage_start + (0.98 - reencode_end) * (0.25 / total_extra_weight)
-        stage_cursor = stage_end
+        stage_start, stage_end = _next_stage_span('blend')
 
         if progress_callback:
             progress_callback('Smoothing with a temporal blend…', stage_start)
@@ -542,6 +580,10 @@ class MemoryMoshApp(tk.Tk):
         self.pixel_sort_key_var = tk.StringVar(value='brightness')
         self.temporal_blend_var = tk.BooleanVar(value=False)
         self.temporal_blend_mode_var = tk.StringVar(value='blend')
+        self.subject_protect_var = tk.BooleanVar(value=False)
+        self.subject_protect_channel_var = tk.StringVar(value='hue')
+        self.subject_protect_low_var = tk.StringVar(value='0')
+        self.subject_protect_high_var = tk.StringVar(value='60')
         self.theme_var = tk.StringVar(value='dark')
         self._description_labels = []
 
@@ -600,6 +642,7 @@ class MemoryMoshApp(tk.Tk):
         ttk.Checkbutton(checkbox_row, text='Analyze audio energy', variable=self.audio_var).grid(row=0, column=1, sticky='w')
         ttk.Checkbutton(checkbox_row, text='Pixel sort (post-process)', variable=self.pixel_sort_var).grid(row=1, column=0, sticky='w', padx=(0, 16), pady=(4, 0))
         ttk.Checkbutton(checkbox_row, text='Smooth (motion interpolation)', variable=self.temporal_blend_var).grid(row=1, column=1, sticky='w', pady=(4, 0))
+        ttk.Checkbutton(checkbox_row, text='Subject protect (HSL mask)', variable=self.subject_protect_var).grid(row=2, column=0, sticky='w', padx=(0, 16), pady=(4, 0))
 
         effect_groups = [
             ('Curve', [
@@ -647,6 +690,28 @@ class MemoryMoshApp(tk.Tk):
                                 'the sharpest jumps (a keyframe removal, a freeze ending) since it tries harder to guess '
                                 'motion that isn\'t really there.'},
             ], 22),
+            ('Subject Protect', [
+                {'label': 'Channel', 'variable': self.subject_protect_channel_var, 'kind': 'combo',
+                 'values': ['hue', 'saturation', 'lightness', 'brightness'],
+                 'description': 'Runs right after the mosh, before pixel-sort/smoothing. Pixels whose value on this '
+                                'channel (from the ORIGINAL clean frame) falls in the Low-High range below are pulled '
+                                'from the clean source instead of the moshed one — so that content keeps moving '
+                                'normally in real time while everything outside the range freezes/drags/glitches as '
+                                'usual. Pick "lightness" or "brightness" for a tone target (white/black/gray), "hue" '
+                                'for a specific color family, "saturation" for vivid-vs-washed-out. Reference ranges '
+                                'for each are under Protect low/high below.'},
+                {'label': 'Protect low', 'variable': self.subject_protect_low_var, 'from_': 0, 'to': 255, 'step': 1,
+                 'description': 'Low end of the protected range (0-255). Tone reference (channel=lightness or '
+                                'brightness): black ~0-50, midtone gray ~100-160, white ~200-255 — set Low/High to '
+                                'the bracket for your target. Saturation reference (channel=saturation): washed-out/'
+                                'white/gray ~0-40, vivid color ~150-255.'},
+                {'label': 'Protect high', 'variable': self.subject_protect_high_var, 'from_': 0, 'to': 255, 'step': 1,
+                 'description': 'High end of the protected range. Color reference (channel=hue, 0-255 scale = '
+                                '0-360°): red ~0-15 (red also wraps to ~240-255 — it sits at both ends of the hue '
+                                'wheel, so one Low-High range can\'t fully cover pure red), orange ~15-30, yellow '
+                                '~30-50, green ~60-110, cyan ~115-140, blue ~145-185, purple/magenta ~190-230. Skin '
+                                'tones typically fall ~0-35. Narrow the range for a tighter, more selective mask.'},
+            ], 25),
         ]
 
         self.group_frames = {}
@@ -663,6 +728,7 @@ class MemoryMoshApp(tk.Tk):
         self._toggle_group('Output', True)
         self._toggle_group('Pixel Sort', True)
         self._toggle_group('Smoothing', True)
+        self._toggle_group('Subject Protect', True)
 
         self.controls_content = ttk.Frame(frame)
         self.controls_content.grid(row=23, column=0, columnspan=3, sticky='nsew', pady=(8, 0))
@@ -1034,6 +1100,10 @@ class MemoryMoshApp(tk.Tk):
             'pixel_sort_aggression': float(self.pixel_sort_aggression_var.get()),
             'temporal_blend_enabled': bool(self.temporal_blend_var.get()),
             'temporal_blend_mode': self.temporal_blend_mode_var.get(),
+            'subject_protect_enabled': bool(self.subject_protect_var.get()),
+            'subject_protect_channel': self.subject_protect_channel_var.get(),
+            'subject_protect_low': float(self.subject_protect_low_var.get()),
+            'subject_protect_high': float(self.subject_protect_high_var.get()),
         }
 
     def _run_pipeline(self):
@@ -1115,6 +1185,15 @@ def parse_args(argv=None):
     p.add_argument('--smooth-mode', choices=['blend', 'motion'], default='blend',
                    help='"blend": gentler motion-compensated blending. "motion": full motion-compensated '
                         'interpolation, stronger but more prone to warping around sharp jumps (default blend)')
+    p.add_argument('--subject-protect', dest='subject_protect_enabled', action='store_true',
+                   help='keep pixels in a hue/saturation/lightness/brightness range moving normally (pulled from '
+                        'the clean source) while everything else freezes/drags/glitches as usual')
+    p.add_argument('--subject-protect-channel', choices=['hue', 'saturation', 'lightness', 'brightness'],
+                   default='hue', help='which property defines the protected range (default hue)')
+    p.add_argument('--subject-protect-low', type=float, default=0.0,
+                   help='low end of the protected range, 0-255 scale (default 0)')
+    p.add_argument('--subject-protect-high', type=float, default=60.0,
+                   help='high end of the protected range, 0-255 scale (default 60)')
     return p.parse_args(argv)
 
 
@@ -1157,6 +1236,10 @@ def main(argv=None):
         'pixel_sort_aggression': args.pixel_sort_aggression,
         'temporal_blend_enabled': args.temporal_blend_enabled,
         'temporal_blend_mode': args.smooth_mode,
+        'subject_protect_enabled': args.subject_protect_enabled,
+        'subject_protect_channel': args.subject_protect_channel,
+        'subject_protect_low': args.subject_protect_low,
+        'subject_protect_high': args.subject_protect_high,
     }
     result = run_pipeline(config)
     print(f"done -> {result['output_path']}")
