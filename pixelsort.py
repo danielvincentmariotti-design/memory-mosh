@@ -191,11 +191,80 @@ def _process_one_frame(task):
     frame_path, out_path, direction, aggression, key = task
     arr = np.array(PIL.Image.open(frame_path).convert('RGB'))
     sorted_arr = pixel_sort_frame(arr, direction, aggression, key=key)
-    PIL.Image.fromarray(sorted_arr).save(out_path)
+    PIL.Image.fromarray(sorted_arr).save(out_path, quality=92)
+
+
+def extract_frames(input_path, frames_dir, label='extract'):
+    """Dump every frame of a video to high-quality .jpg files. Not
+    uncompressed BMP: for a long/high-res clip, two full-resolution BMP
+    frame sets (subject-protect needs both the moshed and clean sides)
+    can hit tens of GB of temp disk. At quality 2 (ffmpeg's mjpeg scale,
+    roughly PIL quality ~92) the loss is invisible against a pipeline
+    that's already gone through several lossy encode passes, for a
+    ~10-15x smaller footprint."""
+    frames_dir = Path(frames_dir)
+    frames_dir.mkdir(parents=True, exist_ok=True)
+    _run_ffmpeg(['-i', str(input_path), '-q:v', '2', str(frames_dir / 'f%06d.jpg')], label)
+    return sorted(frames_dir.glob('*.jpg'))
+
+
+def reassemble_frames(frames_dir, fps, output_path, label='reassemble'):
+    output_path = Path(output_path)
+    if output_path.suffix.lower() == '.webm':
+        codec_args = ['-c:v', 'libvpx-vp9', '-crf', '30', '-b:v', '0']
+    else:
+        codec_args = ['-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-crf', '18']
+    _run_ffmpeg(
+        ['-framerate', str(fps), '-i', str(Path(frames_dir) / 'f%06d.jpg'), *codec_args, str(output_path)],
+        label,
+    )
+
+
+def sort_frames_in_place(frame_paths, direction='both', aggression=0.5, key='brightness',
+                          decay_curve=None, progress_callback=None, progress_start=0.0, progress_end=1.0):
+    """Pixel-sorts each frame file and overwrites it in place — lets a
+    caller chain this with another in-place frame stage (e.g. subject
+    protect) without an extra encode/decode round trip between them."""
+    total = len(frame_paths)
+    if total == 0:
+        return
+
+    if decay_curve:
+        per_frame_curve = _resample_series(decay_curve, total)
+        per_frame_aggression = [aggression_from_curve(aggression, v) for v in per_frame_curve]
+    else:
+        per_frame_aggression = [aggression] * total
+
+    worker_count = max(1, (os.cpu_count() or 2) - 1)
+    if progress_callback:
+        progress_callback(f'Pixel sort: sorting {total} frames across {worker_count} worker processes…',
+                           progress_start)
+
+    tasks = [
+        (str(frame_paths[i]), str(frame_paths[i]), direction, per_frame_aggression[i], key)
+        for i in range(total)
+    ]
+    t0 = time.time()
+    completed = 0
+    with mp.Pool(processes=worker_count) as pool:
+        for _ in pool.imap_unordered(_process_one_frame, tasks, chunksize=4):
+            completed += 1
+            if progress_callback and (completed % 10 == 0 or completed == total):
+                elapsed = time.time() - t0
+                rate = completed / elapsed if elapsed > 0 else 0
+                remaining = (total - completed) / rate if rate > 0 else 0
+                progress_callback(
+                    f'Pixel sort: {completed}/{total} frames (~{remaining:.0f}s remaining)',
+                    progress_start + (progress_end - progress_start) * (completed / total),
+                )
 
 
 def pixel_sort_video(input_path, output_path, direction='both', aggression=0.5, key='brightness',
                       temp_root=None, progress_callback=None, decay_curve=None):
+    """Standalone convenience wrapper: extract -> sort in place -> reassemble.
+    For chaining with another frame-level stage (e.g. subject protect)
+    without a redundant encode/decode round trip, use extract_frames /
+    sort_frames_in_place / reassemble_frames directly instead."""
     if not PIXELSORT_AVAILABLE:
         raise RuntimeError(
             'Pixel sort requires the "pillow" and "numpy" packages, which are not installed. '
@@ -209,61 +278,20 @@ def pixel_sort_video(input_path, output_path, direction='both', aggression=0.5, 
         Path(temp_root).mkdir(parents=True, exist_ok=True)
     workdir = Path(tempfile.mkdtemp(prefix='memory-mosh-pixelsort-', dir=str(temp_root) if temp_root else None))
     frames_dir = workdir / 'frames'
-    sorted_dir = workdir / 'sorted'
-    frames_dir.mkdir(parents=True)
-    sorted_dir.mkdir(parents=True)
 
     try:
         fps = _probe_fps(input_path)
 
         if progress_callback:
-            progress_callback('Pixel sort: extracting frames (uncompressed — fast but uses temp disk space)…', 0.0)
-        # .bmp instead of .png: no compression cost on either the ffmpeg write
-        # or the PIL read, which matters a lot once you're doing it per-frame
-        # across a whole clip.
-        _run_ffmpeg(['-i', str(input_path), str(frames_dir / 'f%06d.bmp')], 'pixel-sort-extract')
+            progress_callback('Pixel sort: extracting frames…', 0.0)
+        frame_paths = extract_frames(input_path, frames_dir, label='pixel-sort-extract')
 
-        frame_paths = sorted(frames_dir.glob('*.bmp'))
-        total = len(frame_paths)
-
-        if decay_curve:
-            per_frame_curve = _resample_series(decay_curve, total)
-            per_frame_aggression = [aggression_from_curve(aggression, v) for v in per_frame_curve]
-        else:
-            per_frame_aggression = [aggression] * total
-
-        worker_count = max(1, (os.cpu_count() or 2) - 1)
-        if progress_callback:
-            progress_callback(f'Pixel sort: sorting {total} frames across {worker_count} worker processes…', 0.05)
-
-        tasks = [
-            (str(frame_paths[i]), str(sorted_dir / frame_paths[i].name), direction, per_frame_aggression[i], key)
-            for i in range(total)
-        ]
-        t0 = time.time()
-        completed = 0
-        with mp.Pool(processes=worker_count) as pool:
-            for _ in pool.imap_unordered(_process_one_frame, tasks, chunksize=4):
-                completed += 1
-                if progress_callback and (completed % 10 == 0 or completed == total):
-                    elapsed = time.time() - t0
-                    rate = completed / elapsed if elapsed > 0 else 0
-                    remaining = (total - completed) / rate if rate > 0 else 0
-                    progress_callback(
-                        f'Pixel sort: {completed}/{total} frames '
-                        f'(~{remaining:.0f}s remaining)',
-                        0.05 + 0.85 * (completed / total),
-                    )
+        sort_frames_in_place(frame_paths, direction=direction, aggression=aggression, key=key,
+                              decay_curve=decay_curve, progress_callback=progress_callback,
+                              progress_start=0.05, progress_end=0.9)
 
         if progress_callback:
             progress_callback('Pixel sort: re-assembling video…', 0.95)
-        if output_path.suffix.lower() == '.webm':
-            codec_args = ['-c:v', 'libvpx-vp9', '-crf', '30', '-b:v', '0']
-        else:
-            codec_args = ['-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-crf', '18']
-        _run_ffmpeg(
-            ['-framerate', str(fps), '-i', str(sorted_dir / 'f%06d.bmp'), *codec_args, str(output_path)],
-            'pixel-sort-reassemble',
-        )
+        reassemble_frames(frames_dir, fps, output_path, label='pixel-sort-reassemble')
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
