@@ -2,241 +2,278 @@
 
 This doc exists so a fresh conversation (Claude Code, a collaborator,
 future-you) has full context without needing the original chat history.
-Drop this in the project root.
+It's rewritten from scratch here — the project has moved a long way past
+the version this doc used to describe. Drop this in the project root
+(it already lives there: `D:\Memory Mosh\PROJECT_HANDOFF.md`).
 
 ## The idea
 
-A datamoshing tool, but built for one specific artistic purpose: make a
-video feel like a fuzzy, half-remembered, loopable memory — meant to
-play all day as ambient art, not be watched start-to-finish. Free and
-open source throughout; no paid services, no API keys.
+A datamoshing tool built for one specific artistic purpose: make a video
+feel like a fuzzy, half-remembered, loopable memory. Free and open
+source throughout — no paid services, no API keys, ever. The user
+explicitly does not want this to "get too big too quickly" — prefers
+incremental scope over a sprawling feature set, but has been steadily
+growing it in well-tested increments over many sessions.
 
-Two separate tools have come out of this, covering two different
-versions of "datamoshing":
+**The browser-app idea from early on never got built.** Everything that
+exists is the desktop Python tool. Don't assume `index.html`/`app.js`
+exist — they don't.
 
-1. Browser app (`index.html`, `app.js`, `style.css`) — simulates the
-datamosh look at the pixel level, runs anywhere (deployable to a
-website, works offline once built out as a PWA). Good for the
-always-on ambient loop use case.
-2. Desktop tool (`desktop/avimosh.py`, `desktop/memory_mosh.py`) —
-does real datamoshing on the actual video bitstream (genuine
-I-frame removal, genuine delta-frame duplication). Only possible on
-desktop because it needs raw bitstream access, which browsers don't
-expose. This is the authentic version of the effect.
+## Where the code lives (all at repo root, not under `desktop/`)
 
-These are not yet connected to each other. A live design question (see
-"next steps") is whether the desktop tool's intensity should be driven
-by the same "vividness curve" concept the browser app uses.
+- `memory_mosh.py` — the GUI (Tkinter) + CLI + `run_pipeline`/
+  `run_pipeline_auto` orchestration. This is the file that changes most.
+- `avimosh.py` — the real bitstream-level datamosh engine (AVI/mpeg4
+  container surgery: keyframe removal, delta-frame duplication). Zero
+  dependencies beyond stdlib. The highest-risk-to-get-wrong file in the
+  project — raw binary format parsing.
+- `pixelsort.py` — threshold-interval pixel sorting as a post-process
+  pass over decoded frames. Needs `pillow` + `numpy` (installed in the
+  project's `.venv`) — the only part of the pipeline that isn't
+  dependency-free.
+- `subject_protect.py` — HSL-based compositing that keeps a color range
+  playing from the clean source while everything else moshes. Shares
+  pixelsort's dependency.
+- `styles.css` — a small custom CSS-like file the GUI parses itself for
+  font styling (see `_load_css_rules`). Not real CSS, don't expect a
+  browser to render it.
+- `spike/` — gitignored scratch/test directory. Throwaway spike scripts
+  and comparison renders live here during development; nothing in it is
+  real project code.
 
----
+Git: this is now a real GitHub repo
+(`github.com/danielvincentmariotti-design/memory-mosh`), branch-per-
+feature workflow, merged into `main` once the user has validated a
+feature actually works (not just that it runs without error).
 
-## Part 1: Browser app
+## How the real mosh mechanism works (avimosh.py)
 
-### Concept
+1. Transcode input to AVI/mpeg4 with a *configurable* keyframe interval
+   (`-g`, default effectively-infinite unless "Force periodic keyframes"
+   is on — see below).
+2. Parse the AVI container directly — `idx1` frame index tells real
+   keyframes from delta frames.
+3. Mosh: keyframes after the first get removed with some probability
+   (real I-frame removal — decoder then applies later motion vectors to
+   a stale reference image, which is *why* removed-keyframe moments make
+   content visibly relocate to the wrong part of the frame, not just
+   freeze). Delta frames get duplicated 2-4x (or a longer freeze) with
+   some probability — this is the actual motion-vector-dragging effect.
+4. Rebuild the AVI byte-for-byte (recomputed `idx1`, patched
+   `dwTotalFrames`/`dwLength`).
+5. Re-encode through ffmpeg into a normal MP4/WebM — the permissive
+   decoder bakes the corruption into pixels, so output plays everywhere.
 
-- A single vividness curve spans the whole clip — a value from 0
-(hazy/decayed) to 1 (vivid) at every point in time. Built from a
-loop-safe sine wave (so it returns to the same value at the end as the
-start — necessary for looping) blended with real motion-energy
-analysis (cheap frame-diffing, no ML) so vividness is biased toward
-moments with actual motion in the source.
-- Low vividness → more corruption. High vividness → mostly clean. This
-ties the "feels like a fading memory" emotional read directly to a
-single tunable curve.
-- Memory intrusions: occasionally cuts away to a more-vivid moment
-pulled from elsewhere in the clip — a short flash, then back — rather
-than playing strictly in chronological order.
-- Loop-melt: the last ~1.5s crossfades into the first ~1.5s so the
-exported clip loops with no hard seam — deliberately leaning into the
-seam as a melt moment rather than hiding it.
+**Keyframe interval matters a lot creatively.** With the old fixed
+`-g 9999`, a single continuous shot with no real scene cuts has almost
+no keyframes to remove, so nearly all visible glitching came from
+delta-frame duplication (stutter-in-place). Lowering the interval
+(GUI: check "Force periodic keyframes", then set "Keyframe interval",
+try 15-60) forces periodic keyframes even on static footage, giving the
+relocation-glitch effect real material to work with. Validated with a
+real before/after comparison against an actual scene cut in test
+footage — dramatic, confirmed difference.
 
-### How the corruption is actually rendered (this evolved a few times)
+## The full pipeline, in order (`run_pipeline` in memory_mosh.py)
 
-This is a simulation, not real datamoshing — it estimates motion
-itself and fakes the look on a `<canvas>`. Current approach (v3):
+1. Transcode to raw AVI/mpeg4 (configurable keyframe interval).
+2. Vividness curve analysis (optional, on by default) — see below.
+3. Mosh (`avimosh.mosh_file`).
+4. Re-encode to MP4/WebM.
+5. **Frame-effects stage** (optional) — subject-protect and pixel-sort
+   (when pixel-sort runs *after* mosh, which is the default) are merged
+   into a single extract-once → apply-in-place → reassemble-once pass,
+   rather than each doing its own full video encode/decode round trip.
+   Subject-protect always runs here (it needs the moshed output to
+   composite against). Pixel-sort *can* instead run *before* the mosh
+   (see "Pixel-sort timing" below) — in that case it happens earlier,
+   on the clean source, before step 1.
+6. Smoothing (optional) — motion-aware `minterpolate`, not a blur; runs
+   last.
 
-- Block-motion drag: coarse block-matching motion estimation against
-the previous frame (downscaled luma diffing, small search window).
-At low vividness, instead of drawing the fresh block, it drags STALE
-texture from a persistent buffer along that motion vector — the
-buffer is never cleared, so this accumulates into real melt/smear
-rather than a crossfade. (An earlier version just alpha-blended a few
-past frames — that read as "frame rate jumping," not bleeding, per
-direct user feedback. The block-drag rewrite fixed that.)
-- Freeze & drip: periodically holds entirely on one frame while a
-separate trail buffer pushes downward and fades each frame, with the
-crisp held frame eroding from the bottom up (alpha gradient mask) to
-reveal the trail beneath. Red/blue channels separate vertically as it
-melts (classic chromatic/CRT-bleed look), plus a couple of soft
-vertical re-draws for motion blur. This was added because "echo
-blending" didn't produce real color bleeds — this does.
-- Chroma bleed: per-channel pixel offset (R/B sampled from different
-x/y positions than G).
-- Slit-scan tearing: random horizontal bands drift sideways, decay
-over a few frames, respawn — for sideways "spill" artifacts.
-- Light grain overlay on top, inversely tied to vividness.
+All of this is wrapped by `run_pipeline_auto`, which is what the GUI
+and CLI actually call (see "Long-form segmentation" below) — it decides
+whether the source needs splitting into chunks first.
 
-### Controls (sliders in the UI)
+## Key concepts and where they live
 
-- `cycles` — how many vividness rise/fall waves across the clip
-- `moshIntensity` (labeled "drag / melt strength") — block-drag
-probability multiplier
-- `meltSize` — block size in px (default 32, range 8-160; smaller =
-finer/more legible corruption, larger = abstract/painterly)
-- `dripAmount` — freeze & drip frequency/intensity (single dial)
-- `colorBleed` — chroma separation strength
-- `intrusion` — memory-intrusion cutaway rate
-- toggles for memory intrusions and loop-seam melt
+### Vividness curve (`build_vividness_curve`)
+A sine wave (loop-safe by default) blended with real motion-energy
+analysis (cheap grayscale frame-diffing, no ML) and optional audio
+energy. Low vividness → more corruption; high vividness → mostly clean.
+Drives `avimosh.rate_from_curve` scaling of keyframe-removal/duplicate/
+freeze rates. **Known asymmetry, not yet resolved**: duplicate_rate and
+freeze_chance are *always* passed through the vividness-scaling formula
+(even with the curve off, via a flat 0.5 default), but
+`keyframe_removal_rate` is applied raw/unscaled always. There's a dead-
+code trail (an unused `keyframe_rate` variable, since removed) that
+suggests someone meant to fix this and didn't. Flagged to the user,
+deliberately left as-is pending a decision — don't silently "fix" it.
 
-### Known limits (not yet built)
+### Forgetting curve (`forgetting_curve_retention`, `build_forgetting_curve`)
+A genuine power-law retention model from the actual forgetting-curve
+literature (`b = 100k / ((log t)^c + k)`), not a placeholder — the user
+specifically asked for this formula. Resets to 1.0 (freshly remembered)
+at the start of every `cycles` cycle and decays across it — same
+cyclical rhythm as the vividness curve, different shape. Drives
+pixel-sort's aggression (`pixelsort.aggression_from_curve`, reusing
+`avimosh.rate_from_curve`'s decay shape). Both curve builders accept
+`t_offset`/`t_span`/`close_loop` params so a long-form render's chunks
+can continue the curve phase across chunk boundaries instead of
+resetting each chunk to its own fresh cycle — see segmentation below.
 
-- Only suited to clips of a few minutes, not the hour-long target —
-motion analysis and rendering both re-seek the `<video>` element frame
-by frame, which doesn't scale to an hour. Needs a `WebCodecs` +
-chunked/Web-Worker rewrite for long-form support.
-- Vividness is fully automatic (motion + sine curve only) — no manual
-override UI yet for promoting/demoting specific moments. (User
-explicitly wants "automatic suggestions, manual override" as the end
-state, not full auto or full manual.)
-- No audio analysis yet (motion only).
-- No PWA/offline shell yet — plain static page.
-- Output is `.webm` via `MediaRecorder`.
-- Not yet tested in an actual browser — written carefully and
-syntax-checked, but no live browser testing has happened. Treat as
-"first pass to react to."
+### Pixel sort (`pixelsort.py`)
+Threshold-interval sort: pixels whose value on a channel
+(brightness/hue/saturation/lightness) falls in a window get sorted
+along rows/cols/both. **Direction** (rows/cols/both), **Sort key**
+(which channel), **Aggression** (window width, curve-driven ceiling),
+**Timing** (`after-mosh` default — sort and mosh stay separate legible
+layers; `before-mosh` — sorted footage gets moshed too, fuses into one
+rougher painterly texture, user confirmed preference for `after-mosh`
+via a real A/B comparison but both are exposed). Multiprocessing across
+CPU cores — this was a real perf problem early on (serial Python loop,
+~0.27s/frame) before parallelizing; now genuinely fast. Intermediate
+frames are JPEG (`-q:v 2`/quality 92), not BMP — BMP was blowing past
+20GB of temp disk on long clips.
 
-### Tech stack (all free/open)
+### Subject protect (`subject_protect.py`)
+HSL-based "protect this color, not remove it" — inverse chroma-key.
+Pixels in the Low-High range (measured on the *clean* source) play
+forward at **normal speed, sequential clean-source frame per output
+frame** — deliberately *not* synced to the mosh's own duplicate/freeze
+timeline, since that was an earlier bug (protected region would freeze
+right along with everything else). Has a GUI reference table (tone/hue
+bands) since a raw color threshold has no concept of "this is a face" —
+it'll grab any pixel in range regardless of shape, which burned the user
+once on busy footage (looked like disconnected color blobs, not a
+protected subject). Works best on simple, well-separated footage.
 
-WebCodecs (future, for long-form) / `<video>` + Canvas (current),
-MediaRecorder for export, vanilla JS, no build step. Fonts via Google
-Fonts CDN (Fraunces serif for headings, Inter for UI, JetBrains Mono for
-readouts). Palette: warm near-black `#16140F`, faded paper `#D8D2C4`,
-dusty rose `#A8776B`, sage `#5C6660`, bone `#F0ECE0` — designed to read
-like an old photograph, not a dev tool.
+### Smoothing (`apply_temporal_blend`)
+Runs last. Started as `tmix` (does nothing on duplicate/frozen frames —
+averaging a frame with copies of itself is a no-op, which is exactly
+where the stutter you'd want smoothed actually is). Now ffmpeg
+`minterpolate` — motion-aware, genuinely fills duplicate/frozen
+stretches. `blend` mode gentler, `motion` mode stronger but more prone
+to warping around the harshest jumps.
 
----
+### Themes
+`dark`, `ember` (default), `vaporwave` (neon-bordered sections via a
+`section_border` palette key), `scooby` (Mystery-Machine palette),
+`win95` (replaced a near-duplicate `light` theme). Real bug fixed here:
+`styles.css` used to hardcode a dark-theme text color that silently
+overrode every theme's own header/label color — that's what made
+headers unreadable on light backgrounds, not anything theme-specific.
 
-## Part 2: Desktop tool (the real thing)
+## Long-form segmentation (the newest, biggest piece — see below for status)
 
-### Why this exists
+**The problem**: ffmpeg splits the mpeg4/AVI intermediate into multiple
+top-level `RIFF`/`AVIX` segments (OpenDML "AVI 2.0") once it passes
+roughly 1GB — common on long and/or high-resolution sources.
+`avimosh.py` only ever read the first segment. Fixed in two layers:
 
-User specifically asked for the literal mechanism: "when the I-frames
-get removed and the delta frames are duplicated." That's not something
-the canvas simulation does — it's a property of the actual compressed
-bitstream. Browsers don't expose this (WebCodecs `VideoDecoder` is
-considered too strict/unpredictable for this — browser-native decoders
-tend to hard-error on missing keyframes rather than gracefully
-corrupting, unlike classic desktop tools). User agreed to drop the
-browser constraint for this piece and go desktop-only.
+1. A real bug fix: an OpenDML `ix00` index chunk inside `movi` was being
+   miscounted as a video frame (off-by-one frame-count mismatch error).
+   Fixed by filtering to real stream-data chunks only (`00dc`/`00db`
+   tags).
+2. A safety net: `avimosh.parse_avi` now detects a multi-segment file
+   and raises a clear error instead of silently processing only the
+   first ~20% of the video (the failure mode *before* this fix — worse
+   than a crash, since it produced a plausible-looking but wrong output
+   with no warning).
 
-### How it works
+**The actual solution** (`run_pipeline_auto`, `estimate_segment_plan`,
+`_run_segmented` in memory_mosh.py): estimate the intermediate size up
+front by test-encoding a real 10-second sample with the exact settings
+that will be used (not a generic resolution/duration guess), and if it
+would land past the ceiling, transparently split the source into chunks
+(ffmpeg segment muxer, stream-copy, no re-encode), run each chunk
+through the *unmodified* `run_pipeline`, and stitch the results back
+together (ffmpeg concat, also stream-copy). A normal-sized clip takes
+the exact same single-pass path as before — confirmed identical, not
+just similar (no `segmented` key in the result dict at all when
+segmentation didn't trigger).
 
-1. Transcode the input to AVI using ffmpeg's `mpeg4` codec with
-`-g 9999` (near-infinite keyframe interval) — most of the video
-becomes one long run of delta (P) frames.
-2. Parse the AVI container directly (`avimosh.py`, zero
-dependencies beyond Python stdlib) — reads the `idx1` frame index to
-tell real keyframes from delta frames via the `AVIIF_KEYFRAME` flag.
-3. Mosh it: keyframes after the first are removed with some
-probability (real I-frame removal — the decoder is then forced to
-apply later motion vectors to a stale reference image). Delta frames
-are duplicated 2-4x with some probability (real motion-vector
-dragging), or much longer for an occasional freeze/drag.
-4. Rebuild the AVI byte-for-byte: new `movi` chunk list, recomputed
-`idx1` (offsets are relative to the `movi` fourcc position — confirmed
-empirically against ffmpeg's own output, not guessed), patched
-`dwTotalFrames`/`dwLength` in the `avih`/`strh` headers.
-5. Re-encode through ffmpeg into a normal MP4/WebM. ffmpeg's own
-decoder is permissive — it renders the corruption rather than
-erroring on the missing keyframes — so the glitch bakes into the
-pixels and the output plays back everywhere normally.
+Per-chunk seeds derive from the base seed (`seed + chunk_index`) instead
+of reusing one seed identically across chunks. Vividness/forgetting
+curves get a phase offset/span per chunk so they continue smoothly
+across chunk boundaries instead of each chunk restarting its own cycle
+— validated the phase math reproduces a single continuous pass almost
+exactly.
 
-### This has been validated, not just written
+**Validated end-to-end on real footage** (forced a 56s clip into 3
+chunks, mosh + pixel-sort both on): split correctly, each chunk
+processed correctly, progress reporting stayed monotonic across all
+three, stats aggregated correctly, stitched output played back clean —
+pulled frames from multiple points, no seam artifacts.
 
-Tested in the sandbox before handing off:
-- Generated two visually distinct synthetic clips (`testsrc` pattern +
-`mandelbrot` fractal), each independently encoded with its own
-keyframe, spliced together at the raw frame level to simulate a real
-scene cut.
-- Confirmed a no-op rebuild round-trip is byte-correct (ffprobe showed
-identical frame composition before/after).
-- Removed the keyframe sitting at the cut. ffmpeg's decoder did NOT
-error — decoded all frames cleanly.
-- Visually confirmed real corruption: extracted frames around the
-cut showed the mandelbrot fractal structure and motion-compensation
-block artifacts bleeding through the testsrc color bars — genuine
-datamosh, not a filter effect.
-- Confirmed the corruption survives a full re-encode to a standard
-MP4 (extracted a frame from the final MP4, pixel-identical corruption
-present).
-- Ran the packaged CLI end-to-end on a fresh clip (ffmpeg `concat`-based
-cut, not the manual splice) — same result, corruption confirmed again.
-- User has since run it themselves on Windows (real footage, not the
-synthetic test clips) — 12 keyframes removed, 1692 duplicate frames
-added out of 3380 original, pipeline completed successfully end to
-end. Visual review of that specific output is still pending feedback.
+**Not yet validated**: a real long-form render (30+ minutes) start to
+finish. This is exactly what triggered the whole feature — the user hit
+the OpenDML crash on a real 34-minute, 1920x1080 source (5.15GB raw AVI
+intermediate, 5 RIFF segments) and, separately, successfully worked
+around it manually by raising `--quality` (more compression) to keep a
+single-pass intermediate under 1GB (took ~8 hours for that one render).
+**The user was about to test the same 33-minute source overnight
+against the new automatic segmentation feature when this handoff was
+written — check with them for the result before doing anything else
+with this feature.** If it worked: merge `feature/long-form-
+segmentation` into `main`. If it didn't: get the actual failure mode
+before guessing at a fix.
 
-### Usage
+**Known gaps in the segmentation feature** (v1, not yet hardened):
+- If a chunk's *own* intermediate still lands past the ceiling despite
+  targeting comfortably under it (700MB target vs ~1GB ceiling, content
+  complexity varies), `_run_segmented` will raise partway through after
+  some chunks already succeeded — no automatic re-chunking/retry.
+- Chunk boundaries come from stream-copy splitting, which can only cut
+  at source keyframes — actual chunk durations vary from the target,
+  usually not by much.
+- No manual override UI for chunk count/duration — fully automatic based
+  on the size estimate.
 
-No pip dependencies — just Python 3 and ffmpeg on PATH.
+## Current git state (branches)
 
-```bash
-python3 memory_mosh.py input.mp4 output.mp4
-```
+- `main` — has everything through: pixel-sort, subject-protect,
+  keyframe-interval control, pixel-sort timing, the AVI multi-segment
+  crash fix + safety net, the intermediate-size warning, and the theme
+  overhaul.
+- `feature/long-form-segmentation` — the automatic segmentation feature
+  described above. Committed, pushed, **not yet merged** — pending the
+  user's overnight real-world test.
+- Older feature branches (`feature/pixel-sort`,
+  `feature/subject-protection`, `feature/keyframe-interval`) still exist
+  on `origin` for reference but are fully merged into `main`; no need to
+  touch them again.
 
-Options: `--keyframe-removal-rate` (default 0.9), `--duplicate-rate`
-(default 0.15), `--duplicate-min`/`--duplicate-max` (default 2-4),
-`--freeze-chance` (default 0.02), `--freeze-min`/`--freeze-max` (default
-6-18), `--quality` (intermediate encode quality, default 3),
-`--seed` (reproducibility), `--keep-intermediate` (keep the raw/moshed
-`.avi` files for inspection instead of deleting them).
+## How this user likes to work (carries across sessions)
 
-Clips with an actual scene cut (so there's a keyframe worth removing)
-produce the most dramatic results — that's the moment one scene's
-motion data gets forced onto the previous scene's stale image.
-
-### Known limits (not yet built)
-
-- Intensity is flat random probability, not tied to the vividness-curve
-concept from the browser app — moshing doesn't currently respond to
-motion or audio automatically. This is the most likely immediate
-next step.
-- No GUI — command line only.
-- Not yet tuned/tested for hour-long source (intermediate `mpeg4`
-transcode step timing/file size unverified at that length).
-- Tested on synthetic clips + one real user run; broader format/codec
-edge cases (resolution extremes, unusual source codecs, files where
-ffmpeg's AVI muxer doesn't write a legacy `idx1` index) haven't been
-exercised.
-
----
-
-## Open design questions / natural next steps
-
-In rough priority order based on where the conversation left off:
-
-1. Tie desktop moshing intensity to motion/vividness — port the
-motion-energy analysis concept from the browser app so
-keyframe-removal-rate and duplicate-rate scale with actual motion in
-the source, instead of being flat constants.
-2. User is mid-testing the desktop tool on real footage — waiting on
-their reaction to a real run (12 keyframes removed, 1692 duplicates)
-before tuning defaults further.
-3. Browser app needs actual browser testing — nothing in it has been
-run live yet.
-4. Manual override UI for the browser app's vividness curve (promote/
-demote specific moments).
-5. Long-form (hour-long) support for both tools.
-6. Eventually: turn this into a real git repo / GitHub project (not done
-yet — currently just a local folder on the user's machine,
-`D:\Memory Mosh` on Windows).
+- Wants a new git branch for any real feature work, never directly on
+  `main`. Merges only after they've personally validated a feature
+  works — not just that it ran without error.
+- Consistently wants things *tested*, not just written: render real
+  output, extract frames, look at them, compare before/after. Several
+  features in this project only reached their current form because an
+  initial version was tested against real footage and turned out to
+  look wrong (subject-protect's color-blob problem, tmix doing nothing
+  on duplicate frames, the frozen-clean-region bug).
+- Likes concrete before/after comparisons when proposing a design
+  change (e.g. mosh-then-sort vs sort-then-mosh, tmix vs minterpolate) —
+  offer to spike and compare rather than just implementing one option.
+- Prefers GUI description text tight and to the point — an earlier pass
+  of this session's own descriptions was flagged as too wordy and
+  rewritten shorter.
+- Interested in genuinely understanding mechanisms (asked for and got a
+  real technical walkthrough of the vividness curve's math, the OpenDML
+  binary index format, etc.) — don't oversimplify explanations for this
+  user.
+- Likes 90s-ish/nostalgic aesthetic touches (vaporwave, Scooby-Doo,
+  Windows 95 themes all came from direct requests).
 
 ## Constraints to keep in mind
 
-- Everything must stay free/open source — no paid services, no API
-keys, ever.
-- User explicitly does not want the project to "get too big too quickly"
-— prefers incremental scope over a sprawling feature set.
-- Browser app and desktop tool are intentionally kept as separate tools
-for separate purposes (deployable ambient loop vs. authentic
-corruption) rather than merged into one thing.
+- Everything free/open source — no paid services, no API keys, ever.
+- Don't let scope balloon — this user has said so explicitly more than
+  once, even while steadily growing the feature set. Ship one tested
+  thing at a time.
+- The core mosh pipeline has no pip dependencies; pixel-sort and
+  subject-protect are the one accepted exception (pillow + numpy,
+  installed in `.venv`) — don't casually add more dependencies.
