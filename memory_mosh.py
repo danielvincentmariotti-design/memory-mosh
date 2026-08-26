@@ -892,6 +892,7 @@ class MemoryMoshApp(tk.Tk):
         self.subject_protect_high_var = tk.StringVar(value='60')
         self.theme_var = tk.StringVar(value='ember')
         self._description_labels = []
+        self._resize_after_id = None
 
         self._build_ui()
 
@@ -1283,8 +1284,20 @@ class MemoryMoshApp(tk.Tk):
                 child.pack_forget()
 
     def _handle_window_resize(self, event=None):
+        # Debounced: Windows fires a burst of Configure events during a live
+        # resize drag (and even just when the window regains focus after a
+        # file dialog closes) — reconfiguring every description label
+        # synchronously on each one blocked the event loop long enough to
+        # show a brief unstyled/black flash before ttk caught up. Only do
+        # the real work once resize activity has settled.
         if not hasattr(self, '_description_labels'):
             return
+        if self._resize_after_id is not None:
+            self.after_cancel(self._resize_after_id)
+        self._resize_after_id = self.after(120, self._apply_resize_wraplength)
+
+    def _apply_resize_wraplength(self):
+        self._resize_after_id = None
         width = max(280, self.winfo_width() - 180)
         for label in self._description_labels:
             if label.winfo_exists():
