@@ -233,21 +233,53 @@ def _probe_duration_seconds(path):
 INTERMEDIATE_SIZE_WARNING_BYTES = 800 * 1024 * 1024
 
 
-def estimate_intermediate_size(input_path, quality, keyframe_interval=9999, sample_seconds=10):
+def estimate_intermediate_size(input_path, quality, keyframe_interval=9999, sample_seconds=10,
+                               presort_pixel_sort=None):
     """Transcodes a short sample with the exact settings run_pipeline's own
     transcode step uses, then extrapolates to the full clip's duration —
     a real estimate of the actual intermediate size, not a generic guess
     from resolution/duration alone. Samples from 10% into the clip rather
     than frame 0, since an intro/title card there tends to under-represent
-    the rest of the video's complexity."""
+    the rest of the video's complexity.
+
+    presort_pixel_sort: pass {'direction', 'aggression', 'key'} when
+    pixel-sort is set to run *before* the mosh — in that mode the real
+    intermediate gets built from already-sorted footage, which compresses
+    far worse than the clean source. Sampling the clean source alone
+    badly underestimates the real size (this is exactly what let a real
+    render pass this check and still fail hours later on the actual
+    transcode)."""
     duration = _probe_duration_seconds(input_path)
     if not duration or duration <= sample_seconds:
         return None
 
     sample_start = min(duration * 0.1, duration - sample_seconds)
     with tempfile.TemporaryDirectory() as tmp:
-        sample_path = Path(tmp) / 'sample.avi'
-        run_ffmpeg(['-ss', str(sample_start), '-i', str(input_path), '-t', str(sample_seconds), '-c:v', 'mpeg4',
+        tmp_path = Path(tmp)
+        transcode_source = input_path
+        ss_args, t_args = ['-ss', str(sample_start)], ['-t', str(sample_seconds)]
+
+        if presort_pixel_sort and pixelsort.PIXELSORT_AVAILABLE:
+            sample_source = tmp_path / 'sample_source.mp4'
+            run_ffmpeg([*ss_args, '-i', str(input_path), *t_args,
+                        '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-an', str(sample_source)],
+                       'size-estimate-presort-extract')
+            frames_dir = tmp_path / 'sample_frames'
+            frame_paths = pixelsort.extract_frames(sample_source, frames_dir, label='size-estimate-presort-frames')
+            pixelsort.sort_frames_in_place(
+                frame_paths,
+                direction=presort_pixel_sort.get('direction', 'both'),
+                aggression=presort_pixel_sort.get('aggression', 0.5),
+                key=presort_pixel_sort.get('key', 'brightness'),
+            )
+            sorted_sample = tmp_path / 'sample_sorted.mp4'
+            pixelsort.reassemble_frames(frames_dir, _probe_fps(sample_source), sorted_sample,
+                                        label='size-estimate-presort-reassemble')
+            transcode_source = sorted_sample
+            ss_args, t_args = [], []  # the sample is already just the short clip
+
+        sample_path = tmp_path / 'sample.avi'
+        run_ffmpeg([*ss_args, '-i', str(transcode_source), *t_args, '-c:v', 'mpeg4',
                     '-g', str(keyframe_interval), '-bf', '0', '-q:v', str(quality), '-an', str(sample_path)],
                    'size-estimate-sample')
         sample_bytes = sample_path.stat().st_size
@@ -730,11 +762,26 @@ def run_pipeline(config, progress_callback=None):
 CHUNK_TARGET_BYTES = 700 * 1024 * 1024
 
 
-def estimate_segment_plan(input_path, quality, keyframe_interval=9999, chunk_target_bytes=CHUNK_TARGET_BYTES):
+def presort_pixel_sort_config(config):
+    """Build the presort_pixel_sort dict estimate_intermediate_size needs
+    when pixel-sort is set to run before the mosh — None otherwise (i.e.
+    the common case: sample the clean source directly, no detour)."""
+    if not config.get('pixel_sort_enabled') or config.get('pixel_sort_timing', 'after-mosh') != 'before-mosh':
+        return None
+    return {
+        'direction': config.get('pixel_sort_direction', 'both'),
+        'aggression': config.get('pixel_sort_aggression', 0.5),
+        'key': config.get('pixel_sort_key', 'brightness'),
+    }
+
+
+def estimate_segment_plan(input_path, quality, keyframe_interval=9999, chunk_target_bytes=CHUNK_TARGET_BYTES,
+                          presort_pixel_sort=None):
     """Returns (estimated_total_bytes, duration_seconds, chunk_count), or
     None if duration/size can't be determined. chunk_count is 1 whenever a
     single pass would stay safely under the size ceiling."""
-    estimated = estimate_intermediate_size(input_path, quality, keyframe_interval)
+    estimated = estimate_intermediate_size(input_path, quality, keyframe_interval,
+                                           presort_pixel_sort=presort_pixel_sort)
     duration = _probe_duration_seconds(input_path)
     if not estimated or not duration:
         return None
@@ -758,7 +805,8 @@ def run_pipeline_auto(config, progress_callback=None):
         # Previews are always short — never worth the size-estimate pass.
         return run_pipeline(config, progress_callback=progress_callback)
 
-    plan = estimate_segment_plan(config['input'], config.get('quality', 3), config.get('keyframe_interval', 9999))
+    plan = estimate_segment_plan(config['input'], config.get('quality', 3), config.get('keyframe_interval', 9999),
+                                 presort_pixel_sort=presort_pixel_sort_config(config))
     if not plan or plan[2] <= 1:
         return run_pipeline(config, progress_callback=progress_callback)
 
@@ -1195,7 +1243,14 @@ class MemoryMoshApp(tk.Tk):
         try:
             quality = int(float(self.quality_var.get()))
             keyframe_interval = int(float(self.keyframe_interval_var.get())) if self.force_keyframe_interval_var.get() else 9999
-            plan = estimate_segment_plan(path, quality, keyframe_interval)
+            presort = None
+            if bool(self.pixel_sort_var.get()) and self.pixel_sort_timing_var.get() == 'before-mosh':
+                presort = {
+                    'direction': self.pixel_sort_direction_var.get(),
+                    'aggression': float(self.pixel_sort_aggression_var.get()),
+                    'key': self.pixel_sort_key_var.get(),
+                }
+            plan = estimate_segment_plan(path, quality, keyframe_interval, presort_pixel_sort=presort)
         except Exception:
             return
         if not plan or plan[2] <= 1:
@@ -1604,7 +1659,8 @@ def main(argv=None):
         'subject_protect_high': args.subject_protect_high,
     }
 
-    plan = estimate_segment_plan(args.input, args.quality, args.keyframe_interval)
+    plan = estimate_segment_plan(args.input, args.quality, args.keyframe_interval,
+                                 presort_pixel_sort=presort_pixel_sort_config(config))
     if plan and plan[2] > 1:
         estimated, _duration, chunk_count = plan
         gb = estimated / (1024 ** 3)
