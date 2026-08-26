@@ -316,7 +316,16 @@ def normalize_series(series):
 
 
 def build_vividness_curve(length, motion_energy=None, audio_energy=None,
-                          cycles=1.5, motion_weight=0.55, audio_weight=0.15):
+                          cycles=1.5, motion_weight=0.55, audio_weight=0.15,
+                          t_offset=0.0, t_span=1.0, close_loop=True):
+    """t_offset/t_span let a caller ask for just a slice of the overall wave
+    (e.g. one chunk of a segmented long render) instead of always spanning
+    the full 0-1 range — so the curve's phase continues smoothly across
+    chunk boundaries rather than resetting at each one. close_loop should
+    only be True for a curve covering the *whole* clip (it forces the first
+    and last sample to match so an export can loop seamlessly) — pass False
+    for an interior chunk, since matching a chunk's own start/end doesn't
+    make the stitched whole loop-safe anyway."""
     if length <= 1:
         return [0.5]
 
@@ -327,14 +336,16 @@ def build_vividness_curve(length, motion_energy=None, audio_energy=None,
 
     curve = []
     for i in range(length):
-        t = i / max(length - 1, 1)
+        local_t = i / max(length - 1, 1)
+        t = t_offset + local_t * t_span
         base_wave = 0.5 + 0.5 * math.sin(2.0 * math.pi * cycles * t)
         blended = ((1.0 - motion_weight - audio_weight) * base_wave +
                    motion_weight * motion_norm[i] +
                    audio_weight * audio_norm[i])
         curve.append(clamp(blended))
 
-    curve[0] = curve[-1] = (curve[0] + curve[-1]) / 2.0
+    if close_loop:
+        curve[0] = curve[-1] = (curve[0] + curve[-1]) / 2.0
     return curve
 
 
@@ -348,16 +359,19 @@ def forgetting_curve_retention(t, k=1.84, c=1.25):
     return (100.0 * k / denom) / 100.0 if denom > 0 else 0.0
 
 
-def build_forgetting_curve(length, cycles=1.5, k=1.84, c=1.25, t_max=60.0):
+def build_forgetting_curve(length, cycles=1.5, k=1.84, c=1.25, t_max=60.0, t_offset=0.0, t_span=1.0):
     """Same cyclical rhythm as the vividness curve (same 'cycles' count),
     but each cycle is a fresh memory event: retention resets to 1.0 at the
     start of every cycle and decays per forgetting_curve_retention across
-    it, rather than following a sine wave."""
+    it, rather than following a sine wave. t_offset/t_span: see
+    build_vividness_curve — same idea, for continuing the cycle phase
+    across segmented-render chunk boundaries."""
     if length <= 1:
         return [1.0]
     curve = []
     for i in range(length):
-        t_norm = i / max(length - 1, 1)
+        local_t = i / max(length - 1, 1)
+        t_norm = t_offset + local_t * t_span
         cycle_frac = (cycles * t_norm) % 1.0
         t_model = 1.0 + cycle_frac * (t_max - 1.0)
         curve.append(forgetting_curve_retention(t_model, k=k, c=c))
@@ -463,7 +477,7 @@ def analyze_audio_energy(input_path, target_length, sample_rate=8000, window=256
 
 def analyze_vividness_curve(input_path, target_length, analysis_fps=4.0,
                             cycles=1.5, motion_weight=0.55, audio_weight=0.15,
-                            include_audio=False):
+                            include_audio=False, t_offset=0.0, t_span=1.0, close_loop=True):
     motion_energy = analyze_motion_energy(input_path, target_length, analysis_fps=analysis_fps)
     audio_energy = []
     if include_audio:
@@ -472,7 +486,8 @@ def analyze_vividness_curve(input_path, target_length, analysis_fps=4.0,
                                  audio_energy=audio_energy,
                                  cycles=cycles,
                                  motion_weight=motion_weight,
-                                 audio_weight=audio_weight)
+                                 audio_weight=audio_weight,
+                                 t_offset=t_offset, t_span=t_span, close_loop=close_loop)
 
 
 def run_pipeline(config, progress_callback=None):
@@ -516,6 +531,14 @@ def run_pipeline(config, progress_callback=None):
     reencode_end = 0.55 if extra_stages else 0.95
     total_extra_weight = sum(STAGE_WEIGHTS[s] for s in extra_stages) or 1.0
 
+    # For a segmented long-form render, each chunk is a slice of the whole
+    # timeline — these keep the vividness/forgetting curves' phase
+    # continuous across chunk boundaries instead of resetting per chunk.
+    # Defaults (0, 1, True) reproduce the old single-pass behavior exactly.
+    curve_t_offset = config.get('curve_phase_offset', 0.0)
+    curve_t_span = config.get('curve_phase_span', 1.0)
+    curve_close_loop = config.get('curve_close_loop', True)
+
     source_path = in_path
     if config.get('preview_duration'):
         preview_path = workdir / f'{in_path.stem}_preview.mp4'
@@ -543,7 +566,8 @@ def run_pipeline(config, progress_callback=None):
 
         presort_curve = None
         if config.get('use_vividness_curve', False):
-            presort_curve = build_forgetting_curve(len(presort_frame_paths), cycles=config.get('curve_cycles', 1.5))
+            presort_curve = build_forgetting_curve(len(presort_frame_paths), cycles=config.get('curve_cycles', 1.5),
+                                                    t_offset=curve_t_offset, t_span=curve_t_span)
 
         def _presort_progress(message, fraction=None):
             if progress_callback:
@@ -591,6 +615,7 @@ def run_pipeline(config, progress_callback=None):
             motion_weight=config.get('motion_weight', 0.55),
             audio_weight=config.get('audio_weight', 0.15),
             include_audio=config.get('include_audio', False),
+            t_offset=curve_t_offset, t_span=curve_t_span, close_loop=curve_close_loop,
         )
 
     if progress_callback:
@@ -663,7 +688,8 @@ def run_pipeline(config, progress_callback=None):
         if frame_effects_pixel_sort:
             forgetting_curve = None
             if config.get('use_vividness_curve', False):
-                forgetting_curve = build_forgetting_curve(frame_count, cycles=config.get('curve_cycles', 1.5))
+                forgetting_curve = build_forgetting_curve(frame_count, cycles=config.get('curve_cycles', 1.5),
+                                                           t_offset=curve_t_offset, t_span=curve_t_span)
 
             sort_end = 0.9
             pixelsort.sort_frames_in_place(
@@ -695,6 +721,131 @@ def run_pipeline(config, progress_callback=None):
 
     stats['output_path'] = str(out_path)
     return stats
+
+
+# ffmpeg splits the mpeg4/AVI intermediate into multiple RIFF segments once
+# it passes roughly 1GB (see avimosh.parse_avi's safety check) — this
+# targets comfortably under that so a chunk's own intermediate shouldn't
+# get there itself.
+CHUNK_TARGET_BYTES = 700 * 1024 * 1024
+
+
+def estimate_segment_plan(input_path, quality, keyframe_interval=9999, chunk_target_bytes=CHUNK_TARGET_BYTES):
+    """Returns (estimated_total_bytes, duration_seconds, chunk_count), or
+    None if duration/size can't be determined. chunk_count is 1 whenever a
+    single pass would stay safely under the size ceiling."""
+    estimated = estimate_intermediate_size(input_path, quality, keyframe_interval)
+    duration = _probe_duration_seconds(input_path)
+    if not estimated or not duration:
+        return None
+    if estimated < INTERMEDIATE_SIZE_WARNING_BYTES:
+        return estimated, duration, 1
+    bytes_per_second = estimated / duration
+    chunk_seconds = max(30.0, chunk_target_bytes / bytes_per_second)
+    chunk_count = max(1, math.ceil(duration / chunk_seconds))
+    return estimated, duration, chunk_count
+
+
+def run_pipeline_auto(config, progress_callback=None):
+    """The entry point the GUI and CLI actually call. Behaves exactly like
+    run_pipeline for anything that fits in a single pass. For a source
+    whose mpeg4/AVI intermediate would land at or past avimosh's single-
+    RIFF-segment ceiling, transparently splits the source into chunks, runs
+    each through the unmodified run_pipeline, and stitches the results back
+    into one output — instead of failing partway through, or (pre-safety-
+    check) silently dropping most of the video."""
+    if config.get('preview_duration'):
+        # Previews are always short — never worth the size-estimate pass.
+        return run_pipeline(config, progress_callback=progress_callback)
+
+    plan = estimate_segment_plan(config['input'], config.get('quality', 3), config.get('keyframe_interval', 9999))
+    if not plan or plan[2] <= 1:
+        return run_pipeline(config, progress_callback=progress_callback)
+
+    _estimated, duration, chunk_count = plan
+    return _run_segmented(config, duration, chunk_count, progress_callback)
+
+
+def _run_segmented(config, duration, chunk_count, progress_callback=None):
+    in_path = Path(config['input'])
+    out_path = Path(config['output'])
+    TEMP_ROOT.mkdir(parents=True, exist_ok=True)
+    workdir = Path(tempfile.mkdtemp(prefix='memory-mosh-segments-', dir=str(TEMP_ROOT)))
+
+    try:
+        chunk_seconds = duration / chunk_count
+        if progress_callback:
+            progress_callback(
+                f'Source is too large for a single pass — splitting into {chunk_count} segments…', 0.0)
+
+        segments_dir = workdir / 'source_segments'
+        segments_dir.mkdir(parents=True)
+        # Stream-copy split (no re-encode) — can only cut at source
+        # keyframes, so actual chunk lengths vary a bit from chunk_seconds;
+        # that's fine, we only need each one comfortably under the ceiling.
+        run_ffmpeg([
+            '-i', str(in_path), '-map', '0:v:0', '-c', 'copy',
+            '-f', 'segment', '-segment_time', str(chunk_seconds), '-reset_timestamps', '1',
+            str(segments_dir / 'chunk_%04d.mp4'),
+        ], 'segment-split')
+
+        chunk_paths = sorted(segments_dir.glob('chunk_*.mp4'))
+        n = len(chunk_paths)
+        if n == 0:
+            raise RuntimeError('Splitting the source into segments produced no output — check the source file.')
+
+        base_seed = config.get('seed')
+        chunk_outputs = []
+        totals = {'keyframes_removed': 0, 'frames_duplicated': 0, 'original_frames': 0, 'output_frames': 0}
+
+        for idx, chunk_path in enumerate(chunk_paths):
+            def _chunk_progress(message, fraction=None, _idx=idx, _n=n):
+                if progress_callback:
+                    overall = ((_idx + (fraction if fraction is not None else 0.0)) / _n) * 0.95
+                    progress_callback(f'[segment {_idx + 1}/{_n}] {message}', overall)
+
+            chunk_config = dict(config)
+            chunk_config['input'] = str(chunk_path)
+            chunk_output = workdir / f'chunk_out_{idx:04d}{out_path.suffix}'
+            chunk_config['output'] = str(chunk_output)
+            chunk_config['keep_intermediate'] = False
+            # Keeps the vividness/forgetting curves' phase continuous across
+            # chunk boundaries — this chunk covers [idx/n, (idx+1)/n) of the
+            # whole timeline, not its own fresh 0-1 span.
+            chunk_config['curve_phase_offset'] = idx / n
+            chunk_config['curve_phase_span'] = 1.0 / n
+            chunk_config['curve_close_loop'] = False
+            if base_seed is not None:
+                chunk_config['seed'] = base_seed + idx  # distinct but reproducible per chunk
+
+            chunk_result = run_pipeline(chunk_config, progress_callback=_chunk_progress)
+            chunk_outputs.append(chunk_output)
+            for key in totals:
+                totals[key] += chunk_result.get(key, 0)
+
+        if progress_callback:
+            progress_callback('Stitching segments back together…', 0.97)
+
+        concat_list = workdir / 'concat_list.txt'
+        with open(concat_list, 'w', encoding='utf-8') as fh:
+            for chunk_output in chunk_outputs:
+                escaped = str(chunk_output.resolve()).replace("'", "'\\''")
+                fh.write(f"file '{escaped}'\n")
+        run_ffmpeg(['-f', 'concat', '-safe', '0', '-i', str(concat_list), '-c', 'copy', str(out_path)],
+                   'segment-concat')
+
+        if progress_callback:
+            progress_callback('Done.', 1.0)
+
+        return {
+            'output_path': str(out_path),
+            'segmented': True,
+            'segment_count': n,
+            **totals,
+        }
+    finally:
+        if not config.get('keep_intermediate', False):
+            shutil.rmtree(workdir, ignore_errors=True)
 
 
 class MemoryMoshApp(tk.Tk):
@@ -1043,15 +1194,16 @@ class MemoryMoshApp(tk.Tk):
         try:
             quality = int(float(self.quality_var.get()))
             keyframe_interval = int(float(self.keyframe_interval_var.get())) if self.force_keyframe_interval_var.get() else 9999
-            estimated = estimate_intermediate_size(path, quality, keyframe_interval)
+            plan = estimate_segment_plan(path, quality, keyframe_interval)
         except Exception:
             return
-        if not estimated or estimated < INTERMEDIATE_SIZE_WARNING_BYTES:
+        if not plan or plan[2] <= 1:
             return
+        estimated, _duration, chunk_count = plan
         gb = estimated / (1024 ** 3)
-        message = (f'⚠ Estimated intermediate ~{gb:.1f}GB at the current Quality setting — likely to exceed '
-                   'the ~1GB single-segment limit and fail partway through. Try a higher Quality number '
-                   '(more compression) or a shorter clip.')
+        message = (f'ℹ Estimated intermediate ~{gb:.1f}GB at the current Quality setting, past the ~1GB '
+                   f'single-segment limit — will run automatically as {chunk_count} segments stitched back '
+                   'together. Takes longer; a higher Quality number (more compression) avoids it entirely.')
         self.after(0, lambda: self.size_warning_var.set(message))
 
     def _pick_output(self):
@@ -1243,7 +1395,7 @@ class MemoryMoshApp(tk.Tk):
             preview_config['output'] = str(Path(config['input']).with_suffix('.preview.mp4'))
             preview_config['keep_intermediate'] = True
             preview_config['preview_duration'] = duration
-            result = run_pipeline(preview_config, progress_callback=self._append_log)
+            result = run_pipeline_auto(preview_config, progress_callback=self._append_log)
             self.after(0, lambda: self._finish_preview(result['output_path']))
         except Exception as exc:
             self.after(0, lambda: self._fail_run(exc))
@@ -1311,7 +1463,7 @@ class MemoryMoshApp(tk.Tk):
 
     def _run_worker(self, config):
         try:
-            result = run_pipeline(config, progress_callback=self._append_log)
+            result = run_pipeline_auto(config, progress_callback=self._append_log)
             self.after(0, lambda: self._finish_run(result))
         except Exception as exc:
             self.after(0, lambda: self._fail_run(exc))
@@ -1320,7 +1472,9 @@ class MemoryMoshApp(tk.Tk):
         self.status_var.set('Completed')
         self.progress_var.set(100.0)
         self._append_log(f"Finished -> {result['output_path']}")
-        messagebox.showinfo('Done', f"Completed with {result['keyframes_removed']} keyframes removed and {result['frames_duplicated']} duplicated frames.")
+        segment_note = f" (processed as {result['segment_count']} segments)" if result.get('segmented') else ''
+        messagebox.showinfo('Done', f"Completed with {result['keyframes_removed']} keyframes removed and "
+                                     f"{result['frames_duplicated']} duplicated frames.{segment_note}")
 
     def _fail_run(self, exc):
         self.status_var.set('Failed')
@@ -1437,14 +1591,15 @@ def main(argv=None):
         'subject_protect_high': args.subject_protect_high,
     }
 
-    estimated = estimate_intermediate_size(args.input, args.quality, args.keyframe_interval)
-    if estimated and estimated >= INTERMEDIATE_SIZE_WARNING_BYTES:
+    plan = estimate_segment_plan(args.input, args.quality, args.keyframe_interval)
+    if plan and plan[2] > 1:
+        estimated, _duration, chunk_count = plan
         gb = estimated / (1024 ** 3)
-        print(f'Warning: estimated intermediate ~{gb:.1f}GB at this quality — likely to exceed the ~1GB '
-              f'single-segment limit and fail partway through. Consider a higher --quality number or a '
-              f'shorter clip.', file=sys.stderr)
+        print(f'Note: estimated intermediate ~{gb:.1f}GB at this quality exceeds the ~1GB single-segment '
+              f'limit — will be processed automatically as {chunk_count} segments and stitched back together.',
+              file=sys.stderr)
 
-    result = run_pipeline(config)
+    result = run_pipeline_auto(config)
     print(f"done -> {result['output_path']}")
 
 
