@@ -69,6 +69,23 @@ def parse_avi(data):
 
     if movi is None or idx1 is None:
         raise ValueError('AVI is missing movi or idx1 — re-export with ffmpeg defaults')
+
+    # ffmpeg splits the file into additional top-level 'RIFF'...'AVIX' segments
+    # once the mpeg4 intermediate passes roughly 1GB (long and/or high-res
+    # sources) — each with its own 'movi' list but no 'idx1'. This parser only
+    # reads the first segment, so silently continuing on a multi-segment file
+    # would drop most of the video rather than mosh it. Fail loudly instead.
+    idx1_off, idx1_size = idx1
+    idx1_end = idx1_off - 8 + idx1_size + (idx1_size % 2)
+    if len(data) - idx1_end > 16:
+        raise ValueError(
+            'This AVI is split into multiple RIFF segments (ffmpeg does this once the mpeg4 '
+            'intermediate passes roughly 1GB — a long and/or high-resolution source). This tool '
+            'only reads the first segment; continuing would silently drop the rest of the video '
+            'instead of moshing it, so it refuses instead. Try a shorter clip, a higher --quality '
+            'number (more compression, smaller intermediate), or lower source resolution.'
+        )
+
     return avih, strh_list, movi, idx1
 
 
@@ -78,6 +95,14 @@ def parse_movi_frames(data, movi):
     movi_data_end = off + size
     frames = []
     for tag, doff, dsize in read_chunks(data, movi_data_start, movi_data_end):
+        # Only real stream-data chunks are frames (AVI convention: 2-digit
+        # stream number + type code, 'dc'=compressed video, 'db'=uncompressed
+        # video). 'JUNK' padding and OpenDML sub-index chunks ('ix00', 'ix01',
+        # ...) can also appear inside movi — on large (>1GB movi) files
+        # ffmpeg adds an extended index this way — and neither has a
+        # matching idx1 entry, which is exactly what caused the mismatch.
+        if tag[2:] not in (b'dc', b'db'):
+            continue
         frames.append({'tag': tag, 'offset': doff, 'size': dsize})
     return frames
 
@@ -141,7 +166,6 @@ def mosh(frames, keyframe_removal_rate=0.9, duplicate_rate=0.15,
             curve_idx = min(i - 1, len(vividness_curve) - 1)
             frame_vividness = vividness_curve[curve_idx]
 
-        keyframe_rate = rate_from_curve(keyframe_removal_rate, frame_vividness)
         duplicate_rate_eff = rate_from_curve(duplicate_rate, frame_vividness)
         freeze_rate_eff = rate_from_curve(freeze_chance, frame_vividness)
 
