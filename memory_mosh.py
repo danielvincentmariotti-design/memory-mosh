@@ -3,12 +3,18 @@
 memory_mosh.py — real datamoshing, desktop edition.
 
 Pipeline:
-  1. Transcode the input to AVI/mpeg4 with a near-infinite keyframe
-     interval (so the source material is mostly one long run of delta
-     frames — the raw stuff datamoshing actually operates on).
+  1. Transcode the input to AVI/mpeg4 with a configurable keyframe
+     interval — near-infinite by default (so the source material is
+     mostly one long run of delta frames), lowered to get periodic
+     keyframes for keyframe-removal to act on even in a single
+     continuous shot with no real scene cuts.
   2. Remove keyframes after the first (real I-frame removal) and
      duplicate selected delta frames (real motion-vector dragging),
-     directly on the encoded bitstream — see avimosh.py.
+     directly on the encoded bitstream — see avimosh.py. Removing a
+     keyframe is what makes later delta frames apply their motion
+     vectors against a stale/wrong reference image — that's what makes
+     content visibly relocate to the wrong part of the frame, not just
+     freeze in place the way plain frame duplication does.
   3. Re-encode the moshed AVI through ffmpeg's own (permissive) decoder
      into a normal, shareable MP4/WebM. The corruption is baked into
      the pixels at this point, so the output plays everywhere.
@@ -33,12 +39,6 @@ import tkinter as tk
 from tkinter import Scrollbar
 
 STYLE_PATH = Path(__file__).with_name('styles.css')
-
-try:
-    import PIL.Image
-    import PIL.ImageTk
-except ImportError:
-    PIL = None
 
 import avimosh
 import pixelsort
@@ -71,31 +71,6 @@ THEMES = {
         'curve_low': '#8b6f47',
         'forget_curve': '#6fb3d9',
     },
-    'light': {
-        'root_bg': '#f3f5f9',
-        'panel_bg': '#ffffff',
-        'section_bg': '#f8f9fc',
-        'text_fg': '#1f2937',
-        'muted_fg': '#667085',
-        'entry_bg': '#ffffff',
-        'entry_fg': '#111827',
-        'entry_active_bg': '#f2f5ff',
-        'button_bg': '#4b6cb7',
-        'button_fg': '#ffffff',
-        'button_active_bg': '#3f5f9d',
-        'button_active_fg': '#ffffff',
-        'check_hover_bg': '#dce7ff',
-        'check_hover_fg': '#1f2937',
-        'progress_bg': '#e5eaf2',
-        'progress_fg': '#2f8f45',
-        'log_bg': '#f8fafc',
-        'log_fg': '#0f172a',
-        'canvas_bg': '#f4f1ea',
-        'curve_line': '#c2b8a3',
-        'curve_peak': '#d08c2f',
-        'curve_low': '#9b7b4c',
-        'forget_curve': '#3f7fbf',
-    },
     'ember': {
         'root_bg': '#19131a',
         'panel_bg': '#241d24',
@@ -120,6 +95,83 @@ THEMES = {
         'curve_peak': '#f0b25d',
         'curve_low': '#8c5a3d',
         'forget_curve': '#4fb3a6',
+    },
+    'vaporwave': {
+        'root_bg': '#1a1030',
+        'panel_bg': '#241640',
+        'section_bg': '#2d1b4d',
+        'text_fg': '#f2e9ff',
+        'muted_fg': '#b39ddb',
+        'entry_bg': '#2a1850',
+        'entry_fg': '#ffe6fa',
+        'entry_active_bg': '#38215f',
+        'button_bg': '#5b2a86',
+        'button_fg': '#ffe6fa',
+        'button_active_bg': '#7c3aad',
+        'button_active_fg': '#ffffff',
+        'check_hover_bg': '#43266b',
+        'check_hover_fg': '#ffffff',
+        'progress_bg': '#2d1b4d',
+        'progress_fg': '#ff6ec7',
+        'log_bg': '#150c28',
+        'log_fg': '#f2e9ff',
+        'canvas_bg': '#1c1235',
+        'curve_line': '#5c4380',
+        'curve_peak': '#00e5ff',
+        'curve_low': '#ff6ec7',
+        'forget_curve': '#ffd23f',
+        'section_border': '#ff36d9',
+    },
+    'scooby': {
+        'root_bg': '#0f2b2b',
+        'panel_bg': '#153636',
+        'section_bg': '#1b4141',
+        'text_fg': '#f5e6c8',
+        'muted_fg': '#a8c9c2',
+        'entry_bg': '#1c4444',
+        'entry_fg': '#fff3d9',
+        'entry_active_bg': '#245252',
+        'button_bg': '#c9762b',
+        'button_fg': '#fff3d9',
+        'button_active_bg': '#e08a35',
+        'button_active_fg': '#ffffff',
+        'check_hover_bg': '#2f6b63',
+        'check_hover_fg': '#ffffff',
+        'progress_bg': '#1b4141',
+        'progress_fg': '#7fa832',
+        'log_bg': '#0a1f1f',
+        'log_fg': '#f5e6c8',
+        'canvas_bg': '#123232',
+        'curve_line': '#3d6b63',
+        'curve_peak': '#e8a33d',
+        'curve_low': '#7fa832',
+        'forget_curve': '#d6547a',
+        'section_border': '#2ee6c9',
+    },
+    'win95': {
+        'root_bg': '#c0c0c0',
+        'panel_bg': '#d4d0c8',
+        'section_bg': '#ece9d8',
+        'text_fg': '#000000',
+        'muted_fg': '#4a4a4a',
+        'entry_bg': '#ffffff',
+        'entry_fg': '#000000',
+        'entry_active_bg': '#fffff0',
+        'button_bg': '#c0c0c0',
+        'button_fg': '#000000',
+        'button_active_bg': '#a0a0a0',
+        'button_active_fg': '#000000',
+        'check_hover_bg': '#316ac5',
+        'check_hover_fg': '#ffffff',
+        'progress_bg': '#d4d0c8',
+        'progress_fg': '#008080',
+        'log_bg': '#000000',
+        'log_fg': '#00ff00',
+        'canvas_bg': '#ffffff',
+        'curve_line': '#808080',
+        'curve_peak': '#ff00ff',
+        'curve_low': '#000080',
+        'forget_curve': '#008080',
     },
 }
 
@@ -157,6 +209,50 @@ def _probe_fps(path):
         den = float(den)
         return float(num) / den if den else 30.0
     return float(value)
+
+
+def _probe_duration_seconds(path):
+    ffprobe = shutil.which('ffprobe')
+    if not ffprobe:
+        return None
+    result = subprocess.run(
+        [ffprobe, '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', str(path)],
+        capture_output=True, text=True,
+    )
+    value = result.stdout.strip()
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
+# ffmpeg splits the mpeg4/AVI intermediate into multiple RIFF segments once it
+# passes roughly 1GB (see avimosh.parse_avi) — this tool only reads the first,
+# so anything landing near or past that ceiling needs a smaller intermediate
+# (higher --quality number) or a shorter clip.
+INTERMEDIATE_SIZE_WARNING_BYTES = 800 * 1024 * 1024
+
+
+def estimate_intermediate_size(input_path, quality, keyframe_interval=9999, sample_seconds=10):
+    """Transcodes a short sample with the exact settings run_pipeline's own
+    transcode step uses, then extrapolates to the full clip's duration —
+    a real estimate of the actual intermediate size, not a generic guess
+    from resolution/duration alone. Samples from 10% into the clip rather
+    than frame 0, since an intro/title card there tends to under-represent
+    the rest of the video's complexity."""
+    duration = _probe_duration_seconds(input_path)
+    if not duration or duration <= sample_seconds:
+        return None
+
+    sample_start = min(duration * 0.1, duration - sample_seconds)
+    with tempfile.TemporaryDirectory() as tmp:
+        sample_path = Path(tmp) / 'sample.avi'
+        run_ffmpeg(['-ss', str(sample_start), '-i', str(input_path), '-t', str(sample_seconds), '-c:v', 'mpeg4',
+                    '-g', str(keyframe_interval), '-bf', '0', '-q:v', str(quality), '-an', str(sample_path)],
+                   'size-estimate-sample')
+        sample_bytes = sample_path.stat().st_size
+
+    return (sample_bytes / sample_seconds) * duration
 
 
 def apply_temporal_blend(input_path, output_path, mode='blend'):
@@ -394,16 +490,24 @@ def run_pipeline(config, progress_callback=None):
     moshed_avi = workdir / f'{in_path.stem}_moshed.avi'
 
     # Stage checkpoints for the overall progress bar. Subject-protect and
-    # pixel-sort are merged into one 'frame_effects' stage — extract frames
-    # once, apply whichever of the two are enabled in place on the same
-    # files, reassemble once — rather than each doing its own full
-    # encode/decode round trip. Temporal blend (motion interpolation) can't
-    # join that: it's a single ffmpeg filter pass, not a per-frame Python step.
+    # pixel-sort (when it runs after the mosh) are merged into one
+    # 'frame_effects' stage — extract frames once, apply whichever of the
+    # two are enabled in place on the same files, reassemble once — rather
+    # than each doing its own full encode/decode round trip. Temporal blend
+    # (motion interpolation) can't join that: it's a single ffmpeg filter
+    # pass, not a per-frame Python step.
     STAGE_WEIGHTS = {'frame_effects': 0.85, 'blend': 0.15}
     subject_protect_enabled = config.get('subject_protect_enabled', False)
     pixel_sort_enabled = config.get('pixel_sort_enabled', False)
     temporal_blend_enabled = config.get('temporal_blend_enabled', False)
-    frame_effects_enabled = subject_protect_enabled or pixel_sort_enabled
+    # Pixel-sort can run before the mosh (sorted footage then gets moshed —
+    # a fused, painterly result since the lossy mosh transcode mangles the
+    # sort streaks further) or after it (the default — mosh corruption and
+    # sort streaks stay legible as separate layers). Subject-protect always
+    # needs the moshed output to composite against, so it can't move.
+    pixel_sort_before_mosh = pixel_sort_enabled and config.get('pixel_sort_timing', 'after-mosh') == 'before-mosh'
+    frame_effects_pixel_sort = pixel_sort_enabled and not pixel_sort_before_mosh
+    frame_effects_enabled = subject_protect_enabled or frame_effects_pixel_sort
     extra_stages = []
     if frame_effects_enabled:
         extra_stages.append('frame_effects')
@@ -420,9 +524,55 @@ def run_pipeline(config, progress_callback=None):
         run_ffmpeg(['-i', str(in_path), '-t', str(config['preview_duration']), '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-an', str(preview_path)], 'preview-trim')
         source_path = preview_path
 
+    # The true, unaltered clean source — kept separate from source_path
+    # (which pixel-sort-before-mosh reassigns below) so subject-protect
+    # always composites against genuinely clean footage, not pre-sorted.
+    true_clean_source = source_path
+
+    # Pixel-sort-before-mosh is by far the slowest single step when active,
+    # so it claims a real chunk of the progress bar up front (40%) instead
+    # of being squeezed into the same sliver the quick preview-trim gets.
+    # Everything after it gets proportionally rescaled into what's left.
+    remaining_start = 0.0
+    if pixel_sort_before_mosh:
+        remaining_start = 0.40
+        if progress_callback:
+            progress_callback('Pixel sorting the clean source before moshing…', 0.0)
+        presort_dir = workdir / 'presort_frames'
+        presort_frame_paths = pixelsort.extract_frames(source_path, presort_dir, label='presort-extract')
+
+        presort_curve = None
+        if config.get('use_vividness_curve', False):
+            presort_curve = build_forgetting_curve(len(presort_frame_paths), cycles=config.get('curve_cycles', 1.5))
+
+        def _presort_progress(message, fraction=None):
+            if progress_callback:
+                progress_callback(message, remaining_start * (fraction if fraction is not None else 0.0))
+
+        pixelsort.sort_frames_in_place(
+            presort_frame_paths,
+            direction=config.get('pixel_sort_direction', 'both'),
+            aggression=config.get('pixel_sort_aggression', 0.5),
+            key=config.get('pixel_sort_key', 'brightness'),
+            decay_curve=presort_curve,
+            progress_callback=_presort_progress, progress_start=0.05, progress_end=0.9,
+        )
+
+        presorted_path = workdir / f'{in_path.stem}_presorted.mp4'
+        pixelsort.reassemble_frames(presort_dir, _probe_fps(source_path), presorted_path, label='presort-reassemble')
+        source_path = presorted_path
+
+    if remaining_start:
+        _inner_progress_callback = progress_callback
+
+        def progress_callback(message, fraction=None):
+            if _inner_progress_callback:
+                remapped = remaining_start + (1.0 - remaining_start) * (fraction if fraction is not None else 0.0)
+                _inner_progress_callback(message, remapped)
+
     if progress_callback:
         progress_callback('Transcoding to a raw AVI/mpeg4 intermediate…', 0.05)
-    run_ffmpeg(['-i', str(source_path), '-c:v', 'mpeg4', '-g', '9999', '-bf', '0',
+    run_ffmpeg(['-i', str(source_path), '-c:v', 'mpeg4', '-g', str(config.get('keyframe_interval', 9999)), '-bf', '0',
                 '-q:v', str(config['quality']), '-an', str(raw_avi)], 'transcode')
 
     raw_data = raw_avi.read_bytes()
@@ -498,9 +648,9 @@ def run_pipeline(config, progress_callback=None):
             clean_frames_dir = workdir / 'frame_effects_clean'
             _frame_progress('Subject protect: extracting clean source frames…', cursor)
             clean_frame_paths = pixelsort.extract_frames(
-                source_path, clean_frames_dir, label='frame-effects-extract-clean')
+                true_clean_source, clean_frames_dir, label='frame-effects-extract-clean')
 
-            protect_end = cursor + (0.45 if pixel_sort_enabled else 0.85)
+            protect_end = cursor + (0.45 if frame_effects_pixel_sort else 0.85)
             subject_protect.composite_frames_in_place(
                 frame_paths, clean_frame_paths,
                 channel=config.get('subject_protect_channel', 'hue'),
@@ -510,7 +660,7 @@ def run_pipeline(config, progress_callback=None):
             )
             cursor = protect_end
 
-        if pixel_sort_enabled:
+        if frame_effects_pixel_sort:
             forgetting_curve = None
             if config.get('use_vividness_curve', False):
                 forgetting_curve = build_forgetting_curve(frame_count, cycles=config.get('curve_cycles', 1.5))
@@ -559,15 +709,19 @@ class MemoryMoshApp(tk.Tk):
         self.input_var = tk.StringVar()
         self.output_var = tk.StringVar()
         self.input_duration_var = tk.StringVar(value='')
+        self.size_warning_var = tk.StringVar(value='')
         self.use_curve_var = tk.BooleanVar(value=True)
         self.audio_var = tk.BooleanVar(value=False)
         self.analysis_fps_var = tk.StringVar(value='4.0')
         self.cycles_var = tk.StringVar(value='1.5')
         self.motion_weight_var = tk.StringVar(value='0.55')
         self.audio_weight_var = tk.StringVar(value='0.15')
+        self.force_keyframe_interval_var = tk.BooleanVar(value=False)
+        self.keyframe_interval_var = tk.StringVar(value='60')
         self.keyframe_rate_var = tk.StringVar(value='0.9')
         self.duplicate_rate_var = tk.StringVar(value='0.15')
-        self.block_size_var = tk.StringVar(value='4')
+        self.duplicate_repeat_min_var = tk.StringVar(value='2')
+        self.duplicate_repeat_max_var = tk.StringVar(value='4')
         self.freeze_chance_var = tk.StringVar(value='0.02')
         self.freeze_min_var = tk.StringVar(value='6')
         self.freeze_max_var = tk.StringVar(value='18')
@@ -578,13 +732,14 @@ class MemoryMoshApp(tk.Tk):
         self.pixel_sort_direction_var = tk.StringVar(value='both')
         self.pixel_sort_aggression_var = tk.StringVar(value='0.5')
         self.pixel_sort_key_var = tk.StringVar(value='brightness')
+        self.pixel_sort_timing_var = tk.StringVar(value='after-mosh')
         self.temporal_blend_var = tk.BooleanVar(value=False)
         self.temporal_blend_mode_var = tk.StringVar(value='blend')
         self.subject_protect_var = tk.BooleanVar(value=False)
         self.subject_protect_channel_var = tk.StringVar(value='hue')
         self.subject_protect_low_var = tk.StringVar(value='0')
         self.subject_protect_high_var = tk.StringVar(value='60')
-        self.theme_var = tk.StringVar(value='dark')
+        self.theme_var = tk.StringVar(value='ember')
         self._description_labels = []
 
         self._build_ui()
@@ -628,7 +783,12 @@ class MemoryMoshApp(tk.Tk):
         ttk.Label(frame, text='Input video', style='Control.TLabel').grid(row=2, column=0, sticky='w', pady=(0, 4))
         ttk.Entry(frame, textvariable=self.input_var, width=44, style='Entry.TEntry').grid(row=2, column=1, sticky='ew', padx=6, pady=(0, 4))
         ttk.Button(frame, text='Browse', command=self._pick_input, style='Secondary.TButton').grid(row=2, column=2, padx=4, pady=(0, 4), sticky='ew')
-        ttk.Label(frame, textvariable=self.input_duration_var, style='Description.TLabel').grid(row=3, column=1, sticky='w', padx=6, pady=(0, 4))
+        input_info = ttk.Frame(frame)
+        input_info.grid(row=3, column=1, columnspan=2, sticky='w', padx=6, pady=(0, 4))
+        ttk.Label(input_info, textvariable=self.input_duration_var, style='Description.TLabel').pack(anchor='w')
+        size_warning_label = ttk.Label(input_info, textvariable=self.size_warning_var, foreground='#e0793c', wraplength=460, justify='left')
+        size_warning_label.pack(anchor='w')
+        self._description_labels.append(size_warning_label)
 
         ttk.Label(frame, text='Output video', style='Control.TLabel').grid(row=4, column=0, sticky='w', pady=(0, 4))
         ttk.Entry(frame, textvariable=self.output_var, width=44, style='Entry.TEntry').grid(row=4, column=1, sticky='ew', padx=6, pady=(0, 4))
@@ -643,6 +803,7 @@ class MemoryMoshApp(tk.Tk):
         ttk.Checkbutton(checkbox_row, text='Pixel sort (post-process)', variable=self.pixel_sort_var).grid(row=1, column=0, sticky='w', padx=(0, 16), pady=(4, 0))
         ttk.Checkbutton(checkbox_row, text='Smooth (motion interpolation)', variable=self.temporal_blend_var).grid(row=1, column=1, sticky='w', pady=(4, 0))
         ttk.Checkbutton(checkbox_row, text='Subject protect (HSL mask)', variable=self.subject_protect_var).grid(row=2, column=0, sticky='w', padx=(0, 16), pady=(4, 0))
+        ttk.Checkbutton(checkbox_row, text='Force periodic keyframes', variable=self.force_keyframe_interval_var).grid(row=2, column=1, sticky='w', pady=(4, 0))
 
         effect_groups = [
             ('Curve', [
@@ -652,9 +813,19 @@ class MemoryMoshApp(tk.Tk):
                 {'label': 'Audio weight', 'variable': self.audio_weight_var, 'from_': 0.0, 'to': 1.0, 'step': 0.05, 'description': 'How strongly audio energy nudges the curve.'},
             ], 7),
             ('Mosh', [
+                {'label': 'Keyframe interval', 'variable': self.keyframe_interval_var, 'from_': 2, 'to': 300, 'step': 1,
+                 'description': 'Needs "Force periodic keyframes" checked, else ignored (old behavior: one keyframe '
+                                'total). Gives keyframe removal real material on a static shot with no scene cuts — '
+                                'a removed keyframe drags a stale reference into new motion vectors, relocating '
+                                'content into the wrong part of the frame instead of just freezing. Try 15-60.'},
                 {'label': 'Keyframe removal rate', 'variable': self.keyframe_rate_var, 'from_': 0.0, 'to': 1.0, 'step': 0.05, 'description': 'How often real keyframes are dropped.'},
                 {'label': 'Duplicate rate', 'variable': self.duplicate_rate_var, 'from_': 0.0, 'to': 1.0, 'step': 0.05, 'description': 'How often delta frames are repeated for glitch streaks.'},
-                {'label': 'Glitch block size', 'variable': self.block_size_var, 'from_': 1, 'to': 12, 'step': 1, 'description': 'How big each repeated glitch block is.'},
+                {'label': 'Duplicate repeat min', 'variable': self.duplicate_repeat_min_var, 'from_': 1, 'to': 12, 'step': 1,
+                 'description': 'How many times a triggered duplicate repeats (randomized min-max) — the actual '
+                                'motion-drag effect. At 1, it\'s a no-op: zero drag. Higher also makes the output '
+                                'video longer (each repeat adds a frame).'},
+                {'label': 'Duplicate repeat max', 'variable': self.duplicate_repeat_max_var, 'from_': 1, 'to': 12, 'step': 1,
+                 'description': 'Upper end of the range above. Keep >= min.'},
                 {'label': 'Freeze chance', 'variable': self.freeze_chance_var, 'from_': 0.0, 'to': 0.25, 'step': 0.01, 'description': 'How often the corruption holds longer as a freeze.'},
                 {'label': 'Freeze min', 'variable': self.freeze_min_var, 'from_': 1, 'to': 24, 'step': 1, 'description': 'Shortest freeze length in frames.'},
                 {'label': 'Freeze max', 'variable': self.freeze_max_var, 'from_': 2, 'to': 48, 'step': 1, 'description': 'Longest freeze length in frames.'},
@@ -670,47 +841,41 @@ class MemoryMoshApp(tk.Tk):
                  'description': 'Which axis pixel runs get sorted along. "both" compounds rows then columns.'},
                 {'label': 'Sort key', 'variable': self.pixel_sort_key_var, 'kind': 'combo',
                  'values': ['brightness', 'hue', 'saturation', 'lightness'],
-                 'description': 'What property decides which pixels are eligible and how they get ordered. '
-                                'Brightness: classic streaks, follows light/dark areas. Hue: sorts by color angle — '
-                                'shifts drift through the rainbow rather than light/dark. Saturation: separates vivid '
-                                'color from washed-out/gray areas. Lightness: brightness-like but color-neutral (HSL), '
-                                'a subtler variant of brightness.'},
+                 'description': 'What decides which pixels get sorted. Brightness: light/dark streaks. Hue: color-'
+                                'angle shifts, not light/dark. Saturation: vivid vs. washed-out. Lightness: '
+                                'color-neutral brightness, subtler than Brightness.'},
                 {'label': 'Aggression', 'variable': self.pixel_sort_aggression_var, 'from_': 0.0, 'to': 1.0, 'step': 0.05,
-                 'description': 'How wide the sort-key window is that gets sorted. Higher = more of the frame dissolves. '
-                                'Acts as a ceiling when "Use vividness curve" is on: low-vividness (forgotten) moments dissolve '
-                                'toward this value, vivid moments stay close to clean.'},
+                 'description': 'How wide the sort-key window is. Higher = more of the frame dissolves. With "Use '
+                                'vividness curve" on, this is a ceiling: forgotten (low-vividness) moments dissolve '
+                                'toward it, vivid moments stay clean.'},
+                {'label': 'Timing', 'variable': self.pixel_sort_timing_var, 'kind': 'combo',
+                 'values': ['after-mosh', 'before-mosh'],
+                 'description': 'After mosh (default): sort and mosh corruption stay legible as separate layers. '
+                                'Before mosh: the sorted footage gets moshed too, fusing both into one rougher, '
+                                'painterly texture. Slower — sorting runs on the full clean clip either way, but '
+                                'before-mosh also means the mosh/re-encode steps work on already-sorted footage.'},
             ], 19),
             ('Smoothing', [
                 {'label': 'Smooth mode', 'variable': self.temporal_blend_mode_var, 'kind': 'combo',
                  'values': ['blend', 'motion'],
-                 'description': 'Runs last, after everything else. Motion-aware (ffmpeg minterpolate), not a simple '
-                                'average — it estimates motion and fills in duplicate/frozen stretches instead of just '
-                                'blurring around them. "blend": gentler motion-compensated blending. "motion": full '
-                                'motion-compensated interpolation — smooths harder, but more likely to warp/ghost around '
-                                'the sharpest jumps (a keyframe removal, a freeze ending) since it tries harder to guess '
-                                'motion that isn\'t really there.'},
+                 'description': 'Runs last. Motion-aware smoothing (ffmpeg minterpolate) — fills frozen/duplicate '
+                                'stretches instead of just blurring around them. Blend: gentler. Motion: stronger, '
+                                'more prone to warping around hard jumps (keyframe removal, freeze endings).'},
             ], 22),
             ('Subject Protect', [
                 {'label': 'Channel', 'variable': self.subject_protect_channel_var, 'kind': 'combo',
                  'values': ['hue', 'saturation', 'lightness', 'brightness'],
-                 'description': 'Runs right after the mosh, before pixel-sort/smoothing. Pixels whose value on this '
-                                'channel (from the ORIGINAL clean frame) falls in the Low-High range below are pulled '
-                                'from the clean source instead of the moshed one — so that content keeps moving '
-                                'normally in real time while everything outside the range freezes/drags/glitches as '
-                                'usual. Pick "lightness" or "brightness" for a tone target (white/black/gray), "hue" '
-                                'for a specific color family, "saturation" for vivid-vs-washed-out. Reference ranges '
-                                'for each are under Protect low/high below.'},
+                 'description': 'Runs after the mosh, before pixel-sort/smoothing. Pixels in the Low-High range '
+                                '(measured on the clean frame) play normally; everything else glitches as usual. '
+                                'Lightness/brightness = tone target, hue = color family, saturation = vivid-vs-'
+                                'washed-out. Reference ranges under Protect low/high.'},
                 {'label': 'Protect low', 'variable': self.subject_protect_low_var, 'from_': 0, 'to': 255, 'step': 1,
-                 'description': 'Low end of the protected range (0-255). Tone reference (channel=lightness or '
-                                'brightness): black ~0-50, midtone gray ~100-160, white ~200-255 — set Low/High to '
-                                'the bracket for your target. Saturation reference (channel=saturation): washed-out/'
-                                'white/gray ~0-40, vivid color ~150-255.'},
+                 'description': 'Low end of the range (0-255). Tone (lightness/brightness): black ~0-50, gray '
+                                '~100-160, white ~200-255. Saturation: washed-out ~0-40, vivid ~150-255.'},
                 {'label': 'Protect high', 'variable': self.subject_protect_high_var, 'from_': 0, 'to': 255, 'step': 1,
-                 'description': 'High end of the protected range. Color reference (channel=hue, 0-255 scale = '
-                                '0-360°): red ~0-15 (red also wraps to ~240-255 — it sits at both ends of the hue '
-                                'wheel, so one Low-High range can\'t fully cover pure red), orange ~15-30, yellow '
-                                '~30-50, green ~60-110, cyan ~115-140, blue ~145-185, purple/magenta ~190-230. Skin '
-                                'tones typically fall ~0-35. Narrow the range for a tighter, more selective mask.'},
+                 'description': 'High end of the range. Hue bands (0-255 = 0-360°): red ~0-15 & ~240-255 (wraps — '
+                                'no single range covers pure red), orange ~15-30, yellow ~30-50, green ~60-110, '
+                                'cyan ~115-140, blue ~145-185, purple ~190-230. Skin tones ~0-35.'},
             ], 25),
         ]
 
@@ -774,8 +939,8 @@ class MemoryMoshApp(tk.Tk):
         self.after(50, self._handle_window_resize)
 
     def _apply_styles(self):
-        theme_name = self.theme_var.get() if hasattr(self, 'theme_var') and self.theme_var.get() else 'dark'
-        palette = THEMES.get(theme_name, THEMES['dark'])
+        theme_name = self.theme_var.get() if hasattr(self, 'theme_var') and self.theme_var.get() else 'ember'
+        palette = THEMES.get(theme_name, THEMES['ember'])
         style = ttk.Style(self)
         style.theme_use('clam')
         css_rules = self._load_css_rules()
@@ -786,7 +951,8 @@ class MemoryMoshApp(tk.Tk):
         self.configure(bg=palette['root_bg'])
 
         style.configure('Panel.TFrame', background=palette['panel_bg'])
-        style.configure('Section.TLabelframe', background=palette['section_bg'], foreground=palette['text_fg'])
+        style.configure('Section.TLabelframe', background=palette['section_bg'], foreground=palette['text_fg'],
+                        bordercolor=palette.get('section_border', palette['section_bg']), borderwidth=2, relief='solid')
         style.configure('Section.TLabelframe.Label', background=palette['section_bg'], foreground=palette['text_fg'], font=('Segoe UI', 11, 'bold'))
 
         title_props = _get_props('.title')
@@ -869,6 +1035,24 @@ class MemoryMoshApp(tk.Tk):
         if path:
             self.input_var.set(path)
             self.input_duration_var.set(self._get_video_duration(path))
+            self.size_warning_var.set('')
+            worker = threading.Thread(target=self._check_intermediate_size, args=(path,), daemon=True)
+            worker.start()
+
+    def _check_intermediate_size(self, path):
+        try:
+            quality = int(float(self.quality_var.get()))
+            keyframe_interval = int(float(self.keyframe_interval_var.get())) if self.force_keyframe_interval_var.get() else 9999
+            estimated = estimate_intermediate_size(path, quality, keyframe_interval)
+        except Exception:
+            return
+        if not estimated or estimated < INTERMEDIATE_SIZE_WARNING_BYTES:
+            return
+        gb = estimated / (1024 ** 3)
+        message = (f'⚠ Estimated intermediate ~{gb:.1f}GB at the current Quality setting — likely to exceed '
+                   'the ~1GB single-segment limit and fail partway through. Try a higher Quality number '
+                   '(more compression) or a shorter clip.')
+        self.after(0, lambda: self.size_warning_var.set(message))
 
     def _pick_output(self):
         path = filedialog.asksaveasfilename(defaultextension='.mp4', filetypes=[('MP4', '*.mp4'), ('WebM', '*.webm')])
@@ -914,7 +1098,7 @@ class MemoryMoshApp(tk.Tk):
             row = ttk.Frame(group)
             row.pack(fill='x', pady=(4, 2))
             row.columnconfigure(1, weight=1)
-            ttk.Label(row, text=label, width=18, anchor='w').grid(row=0, column=0, sticky='w', padx=(0, 8))
+            ttk.Label(row, text=label, width=24, anchor='w').grid(row=0, column=0, sticky='w', padx=(0, 8))
 
             if kind == 'entry':
                 ttk.Entry(row, textvariable=variable, width=16).grid(row=0, column=1, sticky='ew', padx=(0, 6))
@@ -996,7 +1180,7 @@ class MemoryMoshApp(tk.Tk):
                                       cycles=cycles, motion_weight=motion_weight, audio_weight=audio_weight)
         forget_curve = build_forgetting_curve(sample_count, cycles=cycles)
 
-        palette = THEMES.get(self.theme_var.get(), THEMES['dark'])
+        palette = THEMES.get(self.theme_var.get(), THEMES['ember'])
         self.vividness_canvas.create_rectangle(0, 0, width, height, fill=palette['canvas_bg'], outline='')
         self.vividness_canvas.create_line(10, mid_y, width - 10, mid_y, fill=palette['curve_line'], width=1)
 
@@ -1084,10 +1268,11 @@ class MemoryMoshApp(tk.Tk):
             'curve_cycles': float(self.cycles_var.get()),
             'motion_weight': float(self.motion_weight_var.get()),
             'audio_weight': float(self.audio_weight_var.get()),
+            'keyframe_interval': int(float(self.keyframe_interval_var.get())) if self.force_keyframe_interval_var.get() else 9999,
             'keyframe_removal_rate': float(self.keyframe_rate_var.get()),
             'duplicate_rate': float(self.duplicate_rate_var.get()),
-            'duplicate_min': int(float(self.block_size_var.get())),
-            'duplicate_max': int(float(self.block_size_var.get())),
+            'duplicate_min': int(float(self.duplicate_repeat_min_var.get())),
+            'duplicate_max': int(float(self.duplicate_repeat_max_var.get())),
             'freeze_chance': float(self.freeze_chance_var.get()),
             'freeze_min': int(self.freeze_min_var.get()),
             'freeze_max': int(self.freeze_max_var.get()),
@@ -1097,6 +1282,7 @@ class MemoryMoshApp(tk.Tk):
             'pixel_sort_enabled': bool(self.pixel_sort_var.get()),
             'pixel_sort_direction': self.pixel_sort_direction_var.get(),
             'pixel_sort_key': self.pixel_sort_key_var.get(),
+            'pixel_sort_timing': self.pixel_sort_timing_var.get(),
             'pixel_sort_aggression': float(self.pixel_sort_aggression_var.get()),
             'temporal_blend_enabled': bool(self.temporal_blend_var.get()),
             'temporal_blend_mode': self.temporal_blend_mode_var.get(),
@@ -1152,6 +1338,10 @@ def parse_args(argv=None):
     p = argparse.ArgumentParser(description='Real I-frame-removal / delta-frame-duplication datamoshing.')
     p.add_argument('input', nargs='?', help='source video file')
     p.add_argument('output', nargs='?', help='output video file (.mp4 or .webm)')
+    p.add_argument('--keyframe-interval', type=int, default=9999,
+                   help='frames between forced keyframes in the intermediate transcode (default 9999, i.e. '
+                        'effectively none beyond the first — lower it, e.g. 30-60, to give keyframe removal real '
+                        'material on footage with no real scene cuts)')
     p.add_argument('--keyframe-removal-rate', type=float, default=0.9,
                    help='probability a keyframe after the first is removed (0-1, default 0.9)')
     p.add_argument('--duplicate-rate', type=float, default=0.15,
@@ -1180,6 +1370,9 @@ def parse_args(argv=None):
                    help='pixel property used for eligibility + ordering (default brightness)')
     p.add_argument('--pixel-sort-aggression', type=float, default=0.5,
                    help='0-1, how wide the sort-key window is that gets sorted (default 0.5)')
+    p.add_argument('--pixel-sort-timing', choices=['after-mosh', 'before-mosh'], default='after-mosh',
+                   help='"after-mosh" (default): sort and mosh corruption stay separate layers. "before-mosh": '
+                        'sorted footage gets moshed too, fusing both into one rougher texture')
     p.add_argument('--smooth', dest='temporal_blend_enabled', action='store_true',
                    help='motion-aware smoothing (ffmpeg minterpolate) to soften stutter/flicker, runs last')
     p.add_argument('--smooth-mode', choices=['blend', 'motion'], default='blend',
@@ -1220,6 +1413,7 @@ def main(argv=None):
         'curve_cycles': args.curve_cycles,
         'motion_weight': args.motion_weight,
         'audio_weight': args.audio_weight,
+        'keyframe_interval': args.keyframe_interval,
         'keyframe_removal_rate': args.keyframe_removal_rate,
         'duplicate_rate': args.duplicate_rate,
         'duplicate_min': args.duplicate_min,
@@ -1234,6 +1428,7 @@ def main(argv=None):
         'pixel_sort_direction': args.pixel_sort_direction,
         'pixel_sort_key': args.pixel_sort_key,
         'pixel_sort_aggression': args.pixel_sort_aggression,
+        'pixel_sort_timing': args.pixel_sort_timing,
         'temporal_blend_enabled': args.temporal_blend_enabled,
         'temporal_blend_mode': args.smooth_mode,
         'subject_protect_enabled': args.subject_protect_enabled,
@@ -1241,6 +1436,14 @@ def main(argv=None):
         'subject_protect_low': args.subject_protect_low,
         'subject_protect_high': args.subject_protect_high,
     }
+
+    estimated = estimate_intermediate_size(args.input, args.quality, args.keyframe_interval)
+    if estimated and estimated >= INTERMEDIATE_SIZE_WARNING_BYTES:
+        gb = estimated / (1024 ** 3)
+        print(f'Warning: estimated intermediate ~{gb:.1f}GB at this quality — likely to exceed the ~1GB '
+              f'single-segment limit and fail partway through. Consider a higher --quality number or a '
+              f'shorter clip.', file=sys.stderr)
+
     result = run_pipeline(config)
     print(f"done -> {result['output_path']}")
 
