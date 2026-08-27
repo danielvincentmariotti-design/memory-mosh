@@ -36,7 +36,16 @@ a standard, shareable MP4.
 
 ## Usage
 
-Requires Python 3 and ffmpeg on your PATH. No pip dependencies.
+Requires Python 3 and ffmpeg on your PATH.
+
+```bash
+python3 -m venv .venv
+.venv\Scripts\activate      # or: source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+Then either launch the GUI (`launch_memory_mosh.cmd`, or
+`python memory_mosh.py`), or run the CLI directly:
 
 ```bash
 python3 memory_mosh.py input.mp4 output.mp4

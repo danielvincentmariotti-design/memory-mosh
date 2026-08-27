@@ -1,0 +1,9 @@
+# Memory Mosh dependencies. Install with: pip install -r requirements.txt
+#
+# tkinter is stdlib (ships with Python itself, not installed via pip).
+# ffmpeg is a separate binary this tool shells out to — install it
+# system-wide and make sure `ffmpeg`/`ffprobe` are on PATH. Not a
+# pip package, so requirements.txt can't cover it.
+
+numpy==2.5.2
+pillow==12.3.0
