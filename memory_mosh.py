@@ -23,6 +23,7 @@ Requires only ffmpeg on PATH. No pip dependencies.
 """
 
 import argparse
+import json
 import math
 import os
 import shutil
@@ -39,6 +40,7 @@ import tkinter as tk
 from tkinter import Scrollbar
 
 STYLE_PATH = Path(__file__).with_name('styles.css')
+SETTINGS_PATH = Path(__file__).resolve().parent / 'user_settings.json'
 
 import avimosh
 import pixelsort
@@ -898,6 +900,27 @@ def _run_segmented(config, duration, chunk_count, progress_callback=None):
             shutil.rmtree(workdir, ignore_errors=True)
 
 
+# Defaults for every GUI setting that gets persisted (last-used state,
+# presets, and the "Reset to Default" button all key off this). Doesn't
+# include input/output paths or theme-independent transient state
+# (status text, progress, size warnings) — those aren't "settings" in
+# the recipe sense, they're per-session/per-file.
+SETTINGS_DEFAULTS = {
+    'use_curve': True, 'audio': False, 'analysis_fps': '4.0', 'cycles': '1.5',
+    'motion_weight': '0.55', 'audio_weight': '0.15', 'force_keyframe_interval': False,
+    'keyframe_interval': '60', 'keyframe_rate': '0.9', 'duplicate_rate': '0.15',
+    'duplicate_repeat_min': '2', 'duplicate_repeat_max': '4', 'freeze_chance': '0.02',
+    'freeze_min': '6', 'freeze_max': '18', 'quality': '3', 'seed': '', 'preview': '15',
+    'pixel_sort': False, 'pixel_sort_direction': 'both', 'pixel_sort_aggression': '0.5',
+    'pixel_sort_key': 'brightness', 'pixel_sort_timing': 'after-mosh',
+    'temporal_blend': False, 'temporal_blend_mode': 'blend',
+    'subject_protect': False, 'subject_protect_channel': 'hue',
+    'subject_protect_low': '0', 'subject_protect_high': '60',
+    'theme': 'ember',
+}
+PRESET_SLOTS = ('1', '2', '3')
+
+
 class MemoryMoshApp(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -941,10 +964,83 @@ class MemoryMoshApp(tk.Tk):
         self.subject_protect_low_var = tk.StringVar(value='0')
         self.subject_protect_high_var = tk.StringVar(value='60')
         self.theme_var = tk.StringVar(value='ember')
+        self.preset_slot_var = tk.StringVar(value='1')
         self._description_labels = []
         self._resize_after_id = None
 
+        self._user_data = self._load_user_data()
+        self._apply_settings(self._user_data.get('last_used', {}))
+
         self._build_ui()
+        self.protocol('WM_DELETE_WINDOW', self._on_close)
+
+    def _load_user_data(self):
+        """Reads user_settings.json (last-used state + presets). Never
+        raises — a missing or corrupt file just means starting fresh
+        with defaults, same as first run."""
+        if not SETTINGS_PATH.exists():
+            return {}
+        try:
+            with open(SETTINGS_PATH, 'r', encoding='utf-8') as fh:
+                return json.load(fh)
+        except (OSError, ValueError):
+            return {}
+
+    def _save_user_data(self):
+        """Writes via a temp file + os.replace so a crash/forced reboot
+        mid-write can't leave user_settings.json half-written and
+        unreadable next launch (the exact failure mode that made a
+        render's own output file unreadable after last night's forced
+        Windows Update restart)."""
+        try:
+            SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = SETTINGS_PATH.with_suffix('.json.tmp')
+            with open(tmp_path, 'w', encoding='utf-8') as fh:
+                json.dump(self._user_data, fh, indent=2)
+            os.replace(tmp_path, SETTINGS_PATH)
+        except OSError:
+            pass  # settings persistence is a convenience, never worth crashing the app over
+
+    def _collect_settings(self):
+        return {name: getattr(self, f'{name}_var').get() for name in SETTINGS_DEFAULTS}
+
+    def _apply_settings(self, data):
+        for name, value in data.items():
+            if name not in SETTINGS_DEFAULTS:
+                continue  # ignore unknown/stale keys rather than erroring
+            try:
+                getattr(self, f'{name}_var').set(value)
+            except Exception:
+                pass  # a malformed single value shouldn't block the rest from loading
+
+    def _save_last_used(self):
+        self._user_data['last_used'] = self._collect_settings()
+        self._save_user_data()
+
+    def _reset_to_defaults(self):
+        self._apply_settings(SETTINGS_DEFAULTS)
+        self._apply_styles()
+        self._append_log('Settings reset to defaults.')
+
+    def _save_preset(self):
+        slot = self.preset_slot_var.get()
+        self._user_data.setdefault('presets', {})[slot] = self._collect_settings()
+        self._save_user_data()
+        self._append_log(f'Saved current settings to preset {slot}.')
+
+    def _load_preset(self):
+        slot = self.preset_slot_var.get()
+        data = self._user_data.get('presets', {}).get(slot)
+        if not data:
+            messagebox.showinfo('Empty preset', f'Preset {slot} is empty — save something to it first.')
+            return
+        self._apply_settings(data)
+        self._apply_styles()
+        self._append_log(f'Loaded preset {slot}.')
+
+    def _on_close(self):
+        self._save_last_used()
+        self.destroy()
 
     def _build_ui(self):
         canvas = tk.Canvas(self, borderwidth=0, highlightthickness=0)
@@ -1128,6 +1224,16 @@ class MemoryMoshApp(tk.Tk):
         self.preview_panel.configure(style='Section.TLabelframe')
         ttk.Label(self.preview_panel, text='Render a short preview file instead of an in-app player.', foreground='#555').pack(anchor='w')
         ttk.Label(self.preview_panel, text='The preview is written as a .preview.mp4 next to your input video.', foreground='#777').pack(anchor='w', pady=(4, 0))
+
+        self.preset_frame = ttk.Frame(self.controls_content)
+        self.preset_frame.pack(fill='x', pady=(0, 8))
+        ttk.Label(self.preset_frame, text='Preset').pack(side='left', padx=(0, 4))
+        preset_combo = ttk.Combobox(self.preset_frame, textvariable=self.preset_slot_var, values=list(PRESET_SLOTS),
+                                     state='readonly', width=3)
+        preset_combo.pack(side='left', padx=(0, 6))
+        ttk.Button(self.preset_frame, text='Save', command=self._save_preset, style='Secondary.TButton', width=8).pack(side='left', padx=(0, 4))
+        ttk.Button(self.preset_frame, text='Load', command=self._load_preset, style='Secondary.TButton', width=8).pack(side='left', padx=(0, 16))
+        ttk.Button(self.preset_frame, text='Reset to Default', command=self._reset_to_defaults, style='Secondary.TButton').pack(side='left')
 
         self.action_frame = ttk.Frame(self.controls_content)
         self.action_frame.pack(fill='x')
@@ -1524,6 +1630,11 @@ class MemoryMoshApp(tk.Tk):
         if not config['input'] or not config['output']:
             messagebox.showerror('Missing paths', 'Choose both an input and output path first.')
             return
+
+        # Persist before starting, not after — if the machine gets forced
+        # to reboot mid-render (Windows Update did this twice already),
+        # the settings that produced whatever's on disk are still known.
+        self._save_last_used()
 
         self.status_var.set('Working…')
         self.progress_var.set(0.0)

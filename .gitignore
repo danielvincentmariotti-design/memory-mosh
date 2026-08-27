@@ -20,6 +20,10 @@ output/
 outputs/
 raw/
 
+# Per-machine GUI state (last-used settings + presets) — not shared code
+user_settings.json
+user_settings.json.tmp
+
 # Scratch/test renders and throwaway spike scripts, not project code
 spike/
 
