@@ -25,6 +25,15 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    # Only for static analysis — lets type checkers see np/PIL.Image as
+    # always-present, real modules instead of "possibly None", without
+    # making them a hard runtime requirement (see the try/except below,
+    # which is what actually runs).
+    import numpy as np
+    import PIL.Image
 
 try:
     import numpy as np

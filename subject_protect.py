@@ -26,12 +26,18 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from pixelsort import (
     PIXELSORT_AVAILABLE as SUBJECT_PROTECT_AVAILABLE,
     hue_channel, saturation_channel, lightness_channel, luminance,
     extract_frames, reassemble_frames,
 )
+
+if TYPE_CHECKING:
+    # See pixelsort.py's identical comment — static-analysis-only import.
+    import numpy as np
+    import PIL.Image
 
 if SUBJECT_PROTECT_AVAILABLE:
     import numpy as np

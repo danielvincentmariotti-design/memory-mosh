@@ -23,6 +23,9 @@ raw/
 # Scratch/test renders and throwaway spike scripts, not project code
 spike/
 
-# Local env / editor files
-.vscode/
+# Local env / editor files — except settings.json, which just points
+# Pylance at .venv so imports resolve correctly; worth sharing across
+# machines rather than everyone rediscovering the same fix.
+.vscode/*
+!.vscode/settings.json
 .DS_Store

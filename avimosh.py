@@ -180,7 +180,7 @@ def mosh(frames, keyframe_removal_rate=0.9, duplicate_rate=0.15,
         else:
             out.append(f)
 
-    stats = {
+    stats: dict[str, int | str] = {
         'original_frames': len(frames),
         'output_frames': len(out),
         'keyframes_removed': removed_keyframes,

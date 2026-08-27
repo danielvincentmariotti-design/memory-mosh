@@ -621,10 +621,12 @@ def run_pipeline(config, progress_callback=None):
     if remaining_start:
         _inner_progress_callback = progress_callback
 
-        def progress_callback(message, fraction=None):
+        def _remapped_progress_callback(message, fraction=None):
             if _inner_progress_callback:
                 remapped = remaining_start + (1.0 - remaining_start) * (fraction if fraction is not None else 0.0)
                 _inner_progress_callback(message, remapped)
+
+        progress_callback = _remapped_progress_callback
 
     if progress_callback:
         progress_callback('Transcoding to a raw AVI/mpeg4 intermediate…', 0.05)
